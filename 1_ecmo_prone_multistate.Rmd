@@ -1,0 +1,1255 @@
+---
+title: "Analysis of ECMO and prone positioning using a multi-state survival model"
+author: "Adrian Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document:
+        reference_docx: rmarkdown-styles-SAP.docx
+link-citations: yes
+bibliography: bibs.bib
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, comment='', dpi=400)
+options(width=1000) # Wide pages
+options(scipen=999) # avoid scientific presentation
+debug = FALSE # for winbugs
+
+## libraries and functions
+library(diagram)
+library(dplyr)
+options(dplyr.summarise.inform = FALSE)
+library(mstate)
+library(stringr)
+library(flextable)
+library(R2WinBUGS)
+bugs_location = "c:/Program Files/WinBUGS14" # location of the file WinBUGS14.exe
+library(broom) 
+library(cmprsk)
+library(survminer) # for nice plots of competing risks
+# function for preparing data set for mstate package
+source('99_functions.R')
+source("Martin/ext_mstate.R")
+# function for bootstrap confidence intervals
+source("Martin/LOS_boot.R")
+source('99_functions.R')
+# plots
+library(ggplot2)
+library(gridExtra)
+
+# maximum day for plots and estimates
+censor_day = 90
+
+# Data preparation-------------------------------------------------------------
+
+# State 0: Censored
+# State 1: ECMO & supine
+# State 2: Prone
+# State 3: Discharge
+# State 4: Death
+
+## prepare CCC set (with id, from, to, entry, exit; from and to are state numbers)
+load('data/COVID_Data_stroke.RData') # 0_read_data.R
+## apply inclusions
+patients = filter(patients, 
+                  age_five_year_intervals > 15, # only over 15 years old (ideally would be 18)
+                  !is.na(date_ecmo)) # must have started ECMO
+## apply exclusions and count excluded
+ex1 = filter(patients,
+            ecmo_type == 'Venous-Venous') # must be V-V ECMO
+n_exclude_ecmo_type = nrow(patients) - nrow(ex1)
+# patient must be in daily data 
+u = c(unique(daily$pin)) # 
+patients = filter(ex1, pin %in% u)
+n_exclude_no_daily = nrow(ex1) - nrow(patients)
+# final edits
+patients = mutate(patients, 
+         site_num = as.numeric(as.factor(patients$site_name)),
+         # if no final outcome then unknown:
+         outcome = ifelse(outcome=='', 'Unknown', outcome),
+         # if no death date then switch to unknown:
+         outcome = ifelse(outcome=='Death' & is.na(date_death), 'Unknown', outcome),
+         # make pre-ECMO ventilation
+         pre_ecmo_vent = ifelse(is.na(date_mechanical_ventilation) | date_mechanical_ventilation >= date_ecmo, 0, 1),
+         pre_ecmo_vent = factor(pre_ecmo_vent, levels=0:1, labels=c('No','Yes')),
+         # labels
+         ecmo_prone_before = factor(ecmo_prone_before, levels=0:1, labels=c('No','Yes')),
+         # duration of pre-ECMO ventilation
+         dur_pre_ecmo_vent = as.numeric(date_ecmo - date_mechanical_ventilation) + 0.5,
+         dur_pre_ecmo_vent = ifelse(is.na(dur_pre_ecmo_vent) | dur_pre_ecmo_vent < 0, 0, dur_pre_ecmo_vent)
+         ) %>%
+  rename('age' = 'age_five_year_intervals') 
+n_patients = nrow(patients)
+n_sites = max(patients$site_num)
+
+## daily data on date of ECMO ##
+for_join = select(patients, pin, date_ecmo) %>%
+#  mutate(date_ecmo = date_ecmo + 1) %>% # use first full date on ECMO?
+  rename('date_daily' = 'date_ecmo')
+daily_ecmo = left_join(for_join, daily, by=c('pin','date_daily'))
+```
+
+```{r, include=FALSE}
+### prepare data for survival analysis ###
+## ---- transitions
+my.data = time_transitions_ecmo_prone(patients, censor_day = censor_day) %>% # from 99_functions.R
+  select(pin, from, to, start, end, date_ecmo, age, sex, bmi, site_name, site_num, ecmo_prone_before) %>%
+  rename(id = pin, # rename to suit Martin's use
+         entry = start,
+         exit = end)
+
+# Set transition matrix for mstate
+tra <- transMat(x = list(c(2,3,4), c(1,3,4), c(),c()),
+                names = c("ECMO", "Prone", "Discharge","Death"))
+
+# Add transition vectors
+my.data$trans <- NA
+for (i in 1:nrow(tra))
+{
+  for (j in 1:ncol(tra))
+  {
+    my.data$trans[which(my.data$from == i & my.data$to ==j)] <- tra[i, j]  
+  }
+}
+
+# Add status vector, indicates observed transition
+my.data$status <- 1
+# Status vector for censored observations set to '0'
+my.data$status[my.data$to == 0] <- 0
+# Rename 'to' == 0  to 'cens' for use in 'ext_mstate' function
+my.data$to[my.data$to == 0] <- 'cens'
+# Create data frame with all possible transitions for when a patient is at risk
+my.data_ext <- ext_mstate(my.data, tra)
+```
+
+This report uses the data from `r data_date$month` `r data_date$day`. The planned database freeze is October 31.
+
+We include patients with a date of ECMO initiation. We include patients over the age of 15 (note I only have access to age in 5-year intervals). We excluded patients not on V-V ECMO (n = `r n_exclude_ecmo_type`), and patients without daily observations (n = `r n_exclude_no_daily`). The total number of patients is `r n_patients`. The data are from `r n_sites` sites.
+
+The key research question is: if a patient is sick enough to need ECMO, then does proning help? We predominantly use survival analysis to answer this question. 
+### Descriptive statistics 
+
+Here we show descriptive statistics to summarise the included patients.
+
+#### a) Continuous variables - table
+
+```{r}
+### TO add: comorbidity, number of organs failed and degree of respiratory failure.
+
+#
+cont_vars = c('age','bmi','sofa','apache_ii')
+#
+tab = select(patients, pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, Missing, Median, IQR)
+ftab = flextable(tab) %>% 
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+#### a) Continuous variables - histograms
+
+```{r}
+for_plot = select(patients, pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin)
+hplot = ggplot(data=for_plot, aes(x=Value))+
+  geom_histogram(fill='cyan3')+
+  xlab('')+
+  ylab('Count')+
+  facet_wrap(~Variable, scales='free')+
+  theme_bw()
+hplot
+```
+
+The table shows the median and inter-quartile range (IQR) which covers the central 50%.
+
+#### b) Continuous variables from daily data
+
+```{r}
+#
+cont_vars = c('compliance_respiratory_system','eotd_peep','pa_o2','eotd_fi_o2','PaO2_FiO2_ratio')
+#
+tab = mutate(daily_ecmo, 
+             PaO2_FiO2_ratio = pa_o2 / eotd_fi_o2) %>% # is this right?
+  select(pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),1),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),1),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),1),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, Missing, Median, IQR)
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+These are the continuous variables that are collected daily. Here we show the results for the date the patient started ECMO.
+
+#### c) Categorical variables
+
+```{r}
+#
+cat_vars = c('sex','ethnicity','country','pre_ecmo_vent','ecmo_prone_before')
+#
+tab = select(patients, pin, all_of(cat_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(Percent = roundz(prop.table(Count)*100,0)) %>% # calculate percent
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() %>%
+  mutate(Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
+         Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable))
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable")) %>% # merge rows
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+#### d) Pregnant (women only)
+
+```{r}
+#
+tab = filter(patients, sex=='Female') %>%
+  select(pin, 'pregnant') %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(Percent = roundz(prop.table(Count)*100,0), # calculate percent
+         Value = case_when( # add meaningful labels
+          Value == '0'  ~ "No",
+          Value == '1'  ~ "Yes",
+          is.na(Value)==TRUE ~ "Missing"
+        )) %>% 
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() 
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable")) %>% # merge rows
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+#### e) Comorbidities
+
+```{r}
+#
+co_vars = c('comorbidity_hypertension','comorbidity_diabetes','comorbidity_chronic_cardiac_disease','comorbidity_chronic_kidney_disease','comorbidity_malignant_neoplasm','comorbidity_smoking','comorbidity_chronic_alcohol_abuse_eot','comorbidity_immuno_competent_eot','comorbidity_obesity')
+#
+tab = select(patients, pin, all_of(co_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(percent = roundz(prop.table(Count)*100,0),  # calculate percent
+        Value = case_when( # add meaningful labels
+          Value == '0'  ~ "No",
+          Value == '1'  ~ "Yes",
+          is.na(Value)==TRUE ~ "Missing"
+        ),
+        Variable = str_remove(string=Variable, pattern='^comorbidity_'), # tidy up 
+        Variable = str_replace_all(string=Variable, pattern='_', replacement = ' ')) %>%
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() 
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable")) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+#### f) Time variables (in days)
+
+```{r}
+# create time variables
+patients = mutate(patients,
+      date_end = ifelse(is.na(date_discharge)==FALSE, date_discharge, date_death), # end date of death or discharge
+      date_end = as.Date(date_end, origin='1970-01-01'),
+      days_symptoms_hosp = date_admission - date_first_symptom +0.5, 
+      days_hosp = date_end - date_admission + 0.5,
+      duration_prone = prone_end - prone_start + 0.5,
+      duration_mv = date_mech_vent_discontinued - date_mechanical_ventilation +0.5)
+#
+time_vars = c('days_symptoms_hosp','days_hosp','duration_mv','dur_pre_ecmo_vent','duration_prone')
+#
+tab = select(patients, pin, all_of(time_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, Missing, Median, IQR) %>%
+  mutate(Variable = case_when(
+    Variable == 'days_symptoms_hosp' ~ 'First symptom to hospital admission',
+    Variable == 'days_hosp' ~ 'Hospital length of stay',
+    Variable == 'duration_mv' ~ 'Duration of mechanical ventilation',
+    Variable == 'dur_pre_ecmo_vent'~ "Duration of pre-ECMO ventilation",
+    Variable == 'duration_prone' ~ 'Duration of prone position',
+  ))
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+#### g) Patients per site
+
+```{r}
+tab = group_by(patients, site_name) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  mutate(xaxis = rank(count, ties='random'))
+hplot = ggplot(data=tab, aes(x=xaxis, y=count))+
+  geom_col(fill='cyan4', col=grey(0.7))+
+  theme_bw()+
+  scale_x_continuous(breaks=c(1,seq(10,60,10),n_sites))+
+  ylab('Number of patients')+
+  xlab('Site')
+hplot
+# stats for text
+site_med = quantile(tab$count, probs=0.5)
+site_q1 = quantile(tab$count, probs=0.25)
+site_q3 = quantile(tab$count, probs=0.75)
+```
+
+Sites are ordered by the number of patients.
+The median number of patients per site is `r site_med` with an inter-quartile range of `r site_q1` to `r site_q3`.
+
+#### h) Prone before and during ECMO
+
+Here we examine the correlation between patients being in the prone position before and during ECMO.
+
+```{r}
+# 
+tab =  mutate(patients, 
+              ecmo_prone_before = forcats::fct_explicit_na(ecmo_prone_before, na_level = "Missing"), # add missing 
+              any_prone = as.numeric(!is.na(prone_start)), # any prone for those who start
+              any_prone = factor(any_prone, levels=0:1, labels=c('No','Yes'))) %>%
+  select(pin, ecmo_prone_before, any_prone) %>% 
+  group_by(ecmo_prone_before, any_prone) %>%
+  tally() %>% # cross-tabulation
+  tidyr::spread(any_prone, n)
+ftab = flextable(tab) %>%
+  add_header('ecmo_prone_before'='', 'No' = 'Any prone', "Yes" = 'Any prone') %>%
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+There is a strong association between being in a prone position before ECMO and experiencing a prone position during ECMO.
+
+#### i) Final outcome
+
+```{r}
+#
+tab = select(patients, pin, outcome) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(Percent = roundz(prop.table(Count)*100,0)) %>% # calculate percent
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() %>%
+  select(-Variable) # do not need, only one variable
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+### Prone patients over calendar time
+
+```{r, fig.width=8, fig.height=6.5}
+# calculate number in ECMO beds and number prone every day
+time_dates = select(patients, pin, ecmo_start, ecmo_end, prone_start, prone_end)
+denom = numer = NULL
+for (k in 1:nrow(time_dates)){
+  if(!is.na(time_dates$ecmo_start[k])){denom = c(denom, seq(time_dates$ecmo_start[k], time_dates$ecmo_end[k], 1))}
+  if(!is.na(time_dates$prone_start[k])){numer = c(numer, seq(time_dates$prone_start[k], time_dates$prone_end[k], 1))}
+}
+prone_count = data.frame(table(numer)); names(prone_count) = c('date','numer')
+denom_count = data.frame(table(denom)); names(denom_count) = c('date','denom')
+counts = full_join(prone_count, denom_count, by='date') %>%
+  mutate(not = denom - numer, # numbers not on ECMO
+         date = as.Date(as.numeric(as.character(date)), origin='1970-01-01'))
+# data for plot 1
+dplot1 = select(counts, date, not, numer) %>%
+  tidyr::gather(`numer`, `not`, key='type', value = 'count', -`date`) %>%
+  mutate(
+    count = ifelse(is.na(count), 0, count))
+# data for plot 2
+dplot2 = mutate(counts, p = 100 * numer / denom) # percent
+# plot 1
+plot1 = ggplot(data=dplot1, aes(x=date, y=count, fill=factor(type)))+
+  geom_bar(stat='identity')+
+  theme_bw()+
+  ylab('Number of patients')+
+  xlab('Date')+
+  scale_fill_manual(NULL, values=c(c("#FF8C00", "#00688B")), labels=c('ECMO','Prone'))+
+  theme(legend.position = c(0.8,0.8))
+# plot 2
+plot2 = ggplot(data=dplot2, aes(x=date, y=p))+
+  geom_line()+
+  geom_smooth()+
+  ylab('Percent of prone patients')+
+  xlab('Date')+
+  theme_bw()
+grid.arrange(plot1, plot2, nrow=2)
+```
+
+The top plot shows the total number of patients on ECMO every day, and the number of ECMO patients in prone position.
+The bottom plot shows the daily percent of patients on ECMO (black line) and a smoothed estimate of the percent (blue line). The proportion of patients in prone position has decreased over time. The increase in the smoothed estimate to October is based on very few patients. 
+
+We do not have the exact calendar time because dates have been scrambled by around plus/minus 3 days to preserve patient anonymity. 
+
+# Model diagram
+
+The figure below shows the four states in the multi-state survival model. Patients start in the "ECMO & supine" state on the day they begin ECMO. Patients in the prone position on their first day of ECMO start in the "ECMO & Prone" state. Patients can move from Supine to Prone, and back from Prone to Supine.
+
+```{r}
+states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  1,2,
+  3,1,
+  4,1,
+  3,2,
+  4,2
+), byrow = TRUE, ncol=2)
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65) # see 99_functions.R
+```
+
+# Models of prone
+
+Here we examine whether there are important predictors of whether patients get prone positioning. This is important because prone positioning was not a randomly allocated treatment, hence patients who get prone may have important differences from patients who do not. This could then cause confounding when we examine the effects of prone on death and discharge. Understanding the differences between patients who did and did not receive prone positioning will help us understand the potential biases and will also be use to create weights for a propensity weighted analysis.
+
+In the model diagram above, we are interested in all the transitions (arrows) except those from the "ECMO and prone" state, as we are just examining when a patient experiences prone or moves to death or discharge before they can experience prone.
+
+### Cumulative risk plot for prone positioning
+
+The plot below shows the times that patients received prone positioning. For this analysis we examine the time to first prone position and do not consider whether a patient was later moved to supine.
+
+```{r}
+## reminder:
+# State 1: ECMO & supine
+# State 2: Prone
+# State 3: Discharge
+# State 4: Death
+
+# only transitions from not-prone or prone at time zero
+# once a patient hits prone, we are no longer interested for this analysis
+for_prone = filter(my.data, from==1 | (from==2 & entry==0)) %>%
+  mutate(exit = ifelse(from==2, 0, exit), # reset time to zero for those in prone at entry
+         to = ifelse(from==2, 2, to)) %>% # switch those at time zero to prone
+  group_by(id) %>%
+  arrange(id, entry) %>%
+  slice(1) %>% # just first transition (not interested in later transitions)
+  ungroup()
+
+# cumulative incidence
+cum_inc = with(for_prone, cuminc(ftime=exit, fstatus=to, cencode='cens'))
+g = ggcompetingrisks(cum_inc,
+                 xlab = 'Days since ECMO started',
+                 ylab = 'Cumulative probability',
+                 xlim = c(0,censor_day), # 
+                 title = '',
+#                 gsep = '_', # dummy to prevent groups being created from spaces
+                 cumcensor = TRUE, # does not work
+                 legend.title='',
+                 risk.table = TRUE,
+                 conf_int = TRUE)
+# output modified plot
+gmod = g + geom_line(size = 1.05) + # make lines thicker
+  scale_colour_manual(name="State moved to:", values=c(2,3,1), labels=c("Prone","Discharge",'Death')) +  # change labels
+  theme(strip.background = element_blank(), strip.text.x = element_blank()) # remove facet_wrap labels
+gmod
+```
+
+A lot of patients were already prone on the day ECMO started. Those patients who died or were discharged may have eventually experienced prone positioning, but experienced these other events before they could experience prone. We need to account for this censoring when examining the predictors of prone.
+
+## Survival model for prone positioning
+
+We use a Weibull survival model to examine the time to prone position. This models the time to prone position whilst accounting for censoring due to death and discharge, or administrative censoring if the patient is still on ECMO at the end of the study.
+
+```{r, winbugs_model}
+# bugs model
+bfile = 'bugs_survival_prone.txt'
+bugs = file(bfile, 'w')
+cat('model{
+    for (i in 1:N){
+      days[i] ~ dweib(r, mu[i])I(cens[i],) # right-censoring
+      log(mu[i]) <- int + beta[1]*sex[i] + beta[2]*age[i] + beta[3]*calendar_time[i] + beta[4]*bmi[i] + beta[5]*prone_before[i] + centre[site[i]]
+      bmi[i] ~ dnorm(mu.bmi, tau.bmi) # missing BMI
+      prone_before[i] ~ dbern(p) # missing prone before
+    }
+    # priors
+    mu.bmi ~ dnorm(0, 0.1) # vaguely informative (scaled)
+    p ~ dbeta(1, 1) # 
+    tau.bmi ~ dgamma(1, 1)
+    int ~ dnorm(0, 0.0001)
+    for(k in 1:5){beta[k] ~ dnorm(0, 0.0001)}
+    for(k in 1:M){ # random effect for site
+      centre[k] ~ dnorm(0, tau.centre)
+    }
+    tau.centre ~ dgamma(1, 1)
+    r ~ dexp(1)
+    # median estimates
+    median_int <- pow(log(2) * exp(-int), 1/r)
+    for(k in 1:4){
+      median[k] <- pow(log(2) * exp(-(int + beta[k])), 1/r)
+      diff[k] <- median[k] - median_int # difference from intercept
+    }
+    }
+}', file=bugs)
+close(bugs)
+```
+
+```{r, include=FALSE}
+# what events are censored
+cens_events = c('3','4','cens') # discharge, death and admin censoring; moving to prone ('2') is the event
+#
+N = nrow(for_prone)
+M = max(for_prone$site_num)
+for_prone = mutate(for_prone,
+      # add tiny time because time zero not allowed
+      days = ifelse(to %in% cens_events, NA, exit+0.001), # A right censored observation has a missing observed time ...
+      cens = ifelse(to %in% cens_events, exit+0.001, 0)) # ... and a minimum time equal to the censored time
+                   
+# set up survival data for winbugs
+bdata = list(N = N, 
+             M = M,
+             site = for_prone$site_num,
+             days = for_prone$days,
+             cens = for_prone$cens,
+             prone_before = as.numeric(for_prone$ecmo_prone_before=='Yes'),
+             sex = as.numeric(for_prone$sex=='Male'),
+             age = (for_prone$age-50)/10, # scaled
+             bmi = (for_prone$bmi-30)/5, # scaled
+             calendar_time = (as.numeric(for_prone$date_ecmo)-18367)/31 ) # centre and scale to one month
+```
+
+```{r, include=FALSE}
+## run the survival model in WinBUGS
+n.chains= 2
+MCMC = 3000 # increase to 10,000 for final run
+thin = 3 # increase to 3?
+
+# initial values for single variable outcome (use mean for intercept)
+inits = list(r=1, beta=rep(0,5), p=0.5, int=0, tau.centre=1, centre=rep(0, M), mu.bmi=0, tau.bmi=1) 
+inits = rep(list(inits), n.chains) # repeat initial values per chain
+  
+## run WinBUGS once for each of the three models
+parameters = c('r','beta','int','centre','tau.centre','median','diff','bmi')
+bugs_results_prone = bugs(data=bdata, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
+# 
+```
+
+##### Table of hazard ratios for time to prone position
+
+The table below is the hazard ratios and 95% credible intervals for the survival model with prone. 
+A hazard ratio of 1 indicates no change in risk, whereas a hazard ratio above 1 indicates increased risk, and a hazard ratio below 1 indicated decreased risk.
+
+```{r}
+## tabulate the results
+# get beta estimates
+beta = bugs_extract(inbugs=bugs_results_prone, var='beta', exp=TRUE, names=c('Male','Age (+5 years)','Calendar time (+30 days)','BMI (+5 kg/m2)',"Prone before ECMO"), digits=2, make.ci=TRUE) # from 99_functions.R
+ftab = flextable(beta) %>%
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit()
+ftab
+```
+
+Older patients have a reduced hazard of being put in a prone position.
+
+# Models of death and discharge
+
+Here we examine the key outcomes of death and discharge. We examine whether prone positioning is associated with death or discharge whilst controlling for potential confounders.
+
+### Expected length of stay in days and death probability
+
+```{r, death_probs}
+# Analysis ------------------------------------------------------------------------
+
+## Cox model stratified by transition
+c_2 <- coxph(Surv(entry, exit, status==1) ~ strata(trans), data= my.data_ext, method = "breslow")
+# msfit calculates baseline hazards
+msf_2 <- msfit(c_2, trans = tra)
+# probtrans calculates transition probabilities, prediction from day 0
+pt_2 <- probtrans(msf_2, predt = 0)
+
+# Retrieve predicted death risk at last day 
+# Results in Table 3 (https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/s12874-020-01082-z/tables/3)
+pred_1 = (pt_2[[1]]) %>% # Patients starting ECMO
+  mutate(from='ECMO & supine') %>%
+  tail(1) # estimate on last day
+pred_2 = (pt_2[[2]]) %>%  # Patients starting Prone
+  mutate(from='ECMO & prone') %>%
+  tail(1) # estimate on last day
+preds = bind_rows(pred_1, pred_2) %>%
+  mutate(pstate4 = roundz(pstate4*100, 1), # death probability, change to percent
+         se4 = roundz(se4*100, 1),
+         death = paste(pstate4, ' (', se4, ')', sep='')) %>%
+  select(from, death) 
+```
+
+```{r}
+# ELOS gives expected length of stay for up to censor days days in the states for patients in the states at day 0
+# Results shown in Table 3
+LOS_mat_2 <- ELOS(pt_2, censor_day)
+
+### Bootstrapped confidence intervals for length of stay
+# change class of data frame
+class(my.data_ext) <- c("msdata", "data.frame")
+# give transition matrix attribute
+tmat <- attr(my.data_ext, "trans")
+# bootstrap performed with msboot function in mstate, 1000 samples
+set.seed(1906)
+B = 1000 # Should be 5000
+Example2_boot <- msboot(theta = LOS_boot, censor_day=censor_day, data=my.data_ext, id="id", B = B) # 
+
+# Confidence Intervals shown in Table 3
+confidence_intervals = reshape2::melt(Example2_boot) %>%
+  group_by(Var1) %>%
+  summarise(lower = quantile(value, probs=0.025),
+            upper = quantile(value, probs=0.975)) %>%
+  ungroup()
+
+# merge with estimates
+both = bind_cols(as.vector(LOS_mat_2), confidence_intervals[1:16,]) %>% # assumes 4x4 matrix
+  rename('mean' = '...1') %>%
+  mutate(mean = roundz(mean, 1),
+         lower = roundz(lower, 1),
+         upper = roundz(upper, 1),
+         cell = paste(mean, ' (', lower, ', ', upper, ')', sep=''))
+```
+
+```{r, include=FALSE}
+### Expected lengths of stay in days for ending in each of the four states
+# Initial Distribution of the patients in the 4 states at day 0
+# get starting numbers
+starts = filter(my.data, entry==0) %>% 
+  group_by(from) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  mutate(p = prop.table(n))
+init_dis_2 <- c(starts$p, 0, 0) # to update
+
+# Multiply LOS_mat_1 with initial distribution to get weighted average of expected lengths of stay for entire cohort
+# Results shown in Table 3
+LOS_cohort_2 <- (init_dis_2 %*% LOS_mat_2) # sums for each of the four "to" states
+los_cohort_tab = data.frame(t(roundz(LOS_cohort_2,1)))
+colnames(los_cohort_tab) = c("ECMO", "Prone", "Discharge", "Death")
+ 
+# Create weighted average of transition probabilities for progress of entire cohort
+# Used to produce full cohort results in Table 3 
+pt_fc_2 <- pt_2
+fc_2 <- pt_fc_2[[1]] * starts$p[1] + pt_fc_2[[2]] * starts$p[2]
+pt_fc_2[[1]] <- fc_2
+```
+
+```{r, table}
+## make nice table
+states = c("ECMO & supine", "ECMO & prone", "Discharge", "Death")
+#
+both_mat = matrix(both$cell, ncol=4)
+colnames(both_mat) = states
+# more formatting
+LOS_mat_tab = as.data.frame(both_mat)
+LOS_mat_tab$from = states
+LOS_mat_tab = LOS_mat_tab[1:2,] # discard death and discharge from rows
+# add death risk
+LOS_mat_tab = left_join(LOS_mat_tab, preds, by='from') %>%
+  select(from, everything()) # from from to start
+#
+
+## nice table
+# table header
+table_header <- data.frame(
+  col_keys = c( 'from', states, 'death' ),
+  h1 = c('', rep("State moved to", 4), ""),
+  h2 = c('State moved from', states, 'Percent dead'),
+  stringsAsFactors = FALSE )
+# make table
+ftab = flextable(LOS_mat_tab) %>%
+ set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+ merge_h(i=1, part = "header") %>% # merge "To" column headers
+ theme_box() %>% # nice theme
+ align(align='center', part='all') %>% # centre text
+ autofit()
+ftab
+```
+
+The table shows expected lengths of stay between states, with the current state in the rows on the left and the new state in the columns along the top. The results are up to day `r censor_day`. These results do not adjust for potential confounders.
+
+The days in parentheses are 95% confidence intervals based on `r B` bootstrap replications.
+
+The right-most column shows the estimated death percentage and standard error in parentheses.
+
+The results use `r n_patients` patients.
+
+### Plot of predicted probabilities up to day `r censor_day`
+
+```{r}
+par(mai=c(0.9,0.9,0.1,0.1), las=1)
+plot(pt_fc_2, from = 1,  ord = c(4,2,1,3), type= "filled",cols = c("khaki1","indianred1","cornflowerblue","gray"),
+     lwd= 2, xlab = "Days since ECMO started", ylab = "Predicted Probabilities", 
+     cex.lab = 1.25, legend = c("", "", "", ""),
+     main= NULL, axes=FALSE)
+text(0, 0.62, "ECMO &\nsupine", cex = 1, adj=c(-0.1,0.5))
+text(0, 0.2, "ECMO &\nprone", cex = 1, adj=c(-0.1,0.5))
+text(censor_day, 0.9, "Discharge", cex = 1, adj=c(1.1,0.5))
+text(censor_day, 0.15, "Death", cex = 1, adj=c(1.1,0.5)) 
+# better x-axis ticks:
+axis(side=2, at=seq(0,1,0.2), labels=TRUE) # y-axis
+# 28 days
+#axis(side=1, at=seq(0,28,2), labels=FALSE)
+#axis(side=1, at=seq(0,28,7), labels=TRUE, tick=FALSE)
+# 90 days
+axis(side=1, at=seq(0,90,10), labels=FALSE)
+axis(side=1, at=seq(0,90,5), labels=TRUE, tick=FALSE)
+```
+
+## Cumulative risk plots
+
+```{r, fig.width=8.5, fig.height=7}
+# for nice labels
+my.data = mutate(my.data, from.nice=case_when(
+  from==1 ~ 'Supine',
+  from==2 ~ 'Prone'
+  ))
+# cumulative incidence
+cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from.nice, cencode='cens'))
+# remove lines not needed (prone to prone and supine to supine)
+cum_inc[[2]] = NULL
+cum_inc[[2]] = NULL
+# plot
+g = ggcompetingrisks(cum_inc,
+                 xlab = 'Days since ECMO started',
+                 ylab = 'Cumulative probability',
+                 xlim = c(0, censor_day), # 
+                 title = '',
+#                 gsep = '_', # dummy to prevent groups being created from spaces
+                 cumcensor = TRUE, # does not work
+                 legend.title='',
+                 risk.table = TRUE,
+                 conf_int = TRUE)
+# output modified plot
+gmod = g + geom_line(size = 1.05) + # make lines thicker
+  scale_colour_manual(name="State moved to:", values=c(4,2,3,1), labels=c("Supine","Prone","Discharge",'Death')) +  # change labels
+  theme(text = element_text(size=20), 
+        legend.title = element_text(size=16),
+        legend.text = element_text(size=16))
+gmod
+jpeg('figures/competing_risks_ecmo_prone.jpg', width=5, height=4, units='in', res=400, quality=100)
+print(gmod)
+invisible(dev.off())
+```
+
+The plots shows the cumulative probability over time of moving between states. The left panel shows the probabilities for patients in the "ECMO and prone" state, and the right panel shows the probabilities for patients in the "ECMO and supine" state. There is a steady accumulation of deaths in patients in the supine group (black line in right panel), although this slows after around 40 days. The movement of patients from the supine to the prone group greatly reduces after around 12 days (red line in right panel). Patients in the prone position are more likely to eventually experience discharge than patients in the supine position (green lines).
+
+## Survival models
+
+Here we model the survival time and outcome (discharge/death) with the aim of examining prone position whilst adjusting for confounders.
+
+```{r, winbugs_model_death}
+# bugs model
+bfile = 'bugs_survival_prone_death.txt'
+bugs = file(bfile, 'w')
+cat('model{
+    for (i in 1:N){
+      days[i] ~ dweib(r, mu[i])I(cens[i],) # right-censoring
+      log(mu[i]) <- int + beta[1]*sex[i] + beta[2]*age[i] + beta[3]*calendar_time[i] + beta[4]*bmi[i] + beta[5]*prone[i] + centre[site[i]] + patient[id[i]]
+      bmi[i] ~ dnorm(mu.bmi, tau.bmi) # missing BMI
+    }
+    # priors
+    mu.bmi ~ dnorm(0, 0.1) # vaguely informative (scaled)
+    tau.bmi ~ dgamma(1, 1)
+    int ~ dnorm(0, 0.0001)
+    for(k in 1:5){beta[k] ~ dnorm(0, 0.0001)}
+    for(k in 1:M){ # random effect for site
+      centre[k] ~ dnorm(0, tau.centre)
+    }
+    tau.centre ~ dgamma(1, 1)
+    for(k in 1:P){ # random effect for patient
+      patient[k] ~ dnorm(0, tau.id)
+    }
+    tau.id ~ dgamma(1, 1)
+    r ~ dexp(1)
+    }
+}', file=bugs)
+close(bugs)
+# add back later?
+#    # median estimates
+#    median_int <- pow(log(2) * exp(-int), 1/r)
+#    for(k in 1:5){
+#      median[k] <- pow(log(2) * exp(-(int + beta[k])), 1/r)
+#      diff[k] <- median[k] - median_int # difference from intercept
+#    }
+```
+
+#### Time to death and discharge
+
+```{r, include=FALSE}
+## prepare the data, need to use clock reset method
+prepare_survival = function(indata, cens_events){
+bugs_data = mutate(indata,
+    id_num = as.numeric(as.factor(id)), # make ID number
+    # clock reset
+    exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
+    # add tiny time because time zero not allowed
+    days = ifelse(to %in% cens_events, NA, exit+0.001), # A right censored observation has a missing observed time ...
+    cens = ifelse(to %in% cens_events, exit+0.001, 0) # ... and a minimum time equal to the censored time
+                   )
+N = nrow(bugs_data)
+M = max(bugs_data$site_num)
+P = max(bugs_data$id_num)
+
+# set up survival data for winbugs
+bdata = list(N = N, 
+             M = M,
+             P = P,
+             id = bugs_data$id_num,
+             prone = as.numeric(bugs_data$from==2),
+             site = bugs_data$site_num,
+             days = bugs_data$days,
+             cens = bugs_data$cens,
+             sex = as.numeric(bugs_data$sex=='Male'),
+             age = (bugs_data$age-50)/10, # scaled
+             bmi = (bugs_data$bmi-30)/5, # scaled
+             calendar_time = (as.numeric(bugs_data$date_ecmo)-18367)/31 ) # centre and scale to one month
+  return(bdata)
+} # end of function
+for_death = prepare_survival(indata=my.data, cens_events=c('1','2','3','cens')) # supine, prone, discharge or admin censored; event is death ('4')
+for_discharge = prepare_survival(indata=my.data, cens_events=c('1','2','4','cens')) # supine, prone, death or admin censored; event is discharge ('3')
+```
+
+```{r, include=FALSE}
+## run the survival models in WinBUGS
+# could remove individual effect, it is not helping much
+n.chains= 2
+MCMC = 3000 # increase to 10,000 for final run
+thin = 3 # increase to 5?
+
+# initial values for single variable outcome (use mean for intercept)
+inits = list(r=1, beta=rep(0,5), int=0, tau.centre=1, centre=rep(0, for_death$M), patient=rep(0, for_death$P), tau.id=1, mu.bmi=0, tau.bmi=1) 
+inits = rep(list(inits), n.chains) # repeat initial values per chain
+parameters = c('r','beta','int','centre','tau.centre','tau.id','bmi') # ,'median','diff'
+  
+##
+# a) death
+bugs_results_death = bugs(data=for_death, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=111, debug=debug, bugs.directory=bugs_location)
+# a) discharge
+bugs_results_discharge = bugs(data=for_discharge, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
+# 
+```
+
+
+##### Table of hazard ratios for death and discharge
+
+The table below is the hazard ratios (HRs) and 95% credible intervals for the competing risks of death and discharge. 
+A hazard ratio of 1 indicates no change in risk, whereas a hazard ratio above 1 indicates increased risk, and a hazard ratio below 1 indicated decreased risk.
+
+```{r}
+## tabulate the results
+# get beta estimates
+beta_death = bugs_extract(inbugs=bugs_results_death, var='beta', exp=TRUE, names=c('Male','Age (+5 years)','Calendar time (+30 days)','BMI (+5 kg/m2)','Prone position'), digits=2, make.ci=TRUE) # from 99_functions.R
+beta_discharge = bugs_extract(inbugs=bugs_results_discharge, var='beta', exp=TRUE, names=NULL, digits=2, make.ci=TRUE) # from 99_functions.R
+for_table = bind_cols(beta_death, beta_discharge) %>%
+  select(-row, -Var) 
+names(for_table) = c('var','mean1','ci1','mean2','ci2')
+#
+header = read.table(header=TRUE, stringsAsFactors = FALSE, sep="!", text='
+col_keys!colB!colA
+var! !Variable
+mean1!Death!HR
+ci1!Death!95% CI
+mean2!Discharge!HR
+ci2!Discharge!95% CI
+')
+#
+ftab = flextable(for_table) %>%
+  set_header_df(mapping = header, key = "col_keys" ) %>%
+  merge_h(part = "header", i = 1) %>%
+  theme_box() %>% # nice theme 
+  align(align='center', part='all') %>% # centre text
+  autofit()
+ftab
+# bayesian p-value for prone
+pval_prone = sum(bugs_results_death$sims.list$beta[,5]<0) / (length(bugs_results_death$sims.list$beta[,5]) + 1)
+```
+
+Prone position greatly reduces the hazard of death (HR = `r for_table$mean1[5]`). The estimated probability that prone position is associated with a decreased hazard of death is `r round(pval_prone*10000)/10000`, meaning the model strongly supports this association. 
+
+Older age decreases the hazard of discharge (HR = `r for_table$mean2[2]`), which increases the length of time on ECMO.
+Calendar time has a strong effect on discharge (HR = `r for_table$mean2[3]`), with longer times on ECMO (reduced discharge hazard) over time. 
+
+## Cumulative survival models
+
+The survival models in this section focus on the patients' final (or cumulative) outcome of death and discharge, whereas the previous models examined the instantaneous hazard of experiencing death or discharge. 
+
+##### Table of ratios and 95% confidence intervals for cumulative regression
+
+The table below shows the cumulative hazard ratios and 95% confidence intervals for death and discharge.
+
+```{r}
+my.data_crr = mutate(my.data, 
+  # clock reset
+  exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
+  # prepare variables
+   bmi = ifelse(is.na(bmi), mean(bmi, na.rm=TRUE), bmi),
+   prone = as.numeric(from==2),
+   age = (age-50)/10, # scaled
+   bmi = (bmi-30)/5, # scaled
+   calendar_time = (as.numeric(date_ecmo)-18367)/31,
+   sex = as.numeric(sex=='Male'))
+cov1 = as.matrix(select(my.data_crr, sex, age, calendar_time, bmi, prone))
+# death model
+cum_rr_death = with(my.data_crr, crr(ftime=exit, fstatus=to==4, cov1=cov1, cencode='cens', maxiter = 100))
+# discharge model
+cum_rr_discharge = with(my.data_crr, crr(ftime=exit, fstatus=to==3, cov1=cov1, cencode='cens', maxiter = 100))
+s_death = summary(cum_rr_death) # cannot use broom
+s_discharge = summary(cum_rr_discharge) # cannot use broom
+table_death = as.data.frame(s_death$coef); names(table_death) = c('coef','exp_coef','SE','z','pval')
+table_discharge = as.data.frame(s_discharge$coef); names(table_discharge) = c('coef','exp_coef','SE','z','pval')
+tab = bind_rows(table_death, table_discharge, .id='type') # combine tables
+table = mutate(tab,
+         z = qnorm(0.975),
+         lower = coef - (z*SE), # make CIs
+         upper = coef + (z*SE),
+         HR = roundz(exp(coef), 2),
+         lower = roundz(exp(lower), 2),
+         upper = roundz(exp(upper), 2),
+         CI = paste(lower, ' to ', upper, sep='')) %>%
+  select(type, HR, CI) 
+ftable = bind_cols(filter(table, type==1) %>% select(-type),
+                  filter(table, type==2) %>% select(-type))
+names(ftable) = c('HR1','CI1','HR2','CI2')
+ftable = mutate(ftable, Variable=c('Male','Age (+5 years)','Calendar time (+30 days)','BMI (+5 kg/m2)',"Prone position")) %>%
+  select('Variable', everything()) %>% # move Variable first
+  flextable() %>%
+  add_header('Variable'='', 'HR1' = 'Death', 'CI1' = 'Death', 'HR2' = 'Discharge', 'CI2' = 'Discharge') %>%
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit() 
+ftable
+```
+
+Prone position strongly decreases the probability of death and increases the probability of discharge.
+
+##### Plot of model predictions for cumulative regression
+
+```{r}
+## plot predictions
+# make predictions
+pred.cov1 = as.matrix(data.frame(sex=1, age=0, calendar_time=0, bmi=0, prone=c(0,1)))
+pred_death = as.matrix(predict(cum_rr_death, cov1 = pred.cov1))
+pred_discharge = as.matrix(predict(cum_rr_discharge, cov1 = pred.cov1))
+class(pred_death) = 'matrix'
+class(pred_discharge) = 'matrix'
+colnames(pred_death) = c('days','0','1')
+colnames(pred_discharge) = c('days','0','1')
+pred = bind_rows(as.data.frame(pred_death), as.data.frame(pred_discharge), .id='type') %>%
+  tidyr::gather(`0` , `1`, key='prone', value='crr', -type) %>%
+  mutate(type_nice = factor(type, levels=1:2, labels=c('Death','Discharge')))
+# plot
+pred_plot = ggplot(data=pred, aes(x=days, y=crr, col=factor(prone)))+
+  geom_line(size=1.05)+
+  theme_bw()+
+  scale_color_manual('Prone', labels=c('No','Yes'), values=c('cyan4','darkorange'))+
+  xlab('Days since ECMO')+
+  ylab('Cumulative probability of death')+
+  theme(legend.position = c(0.8, 0.15))+
+  facet_wrap(~type_nice)
+pred_plot
+```
+
+The plots above show the cumulative predicted probabilities of death and discharge for a patient of average age and BMI. By day 80 there are very large gaps in the probability of both death and discharge for patients in supine and prone position. 
+
+# Statistical methods section for paper
+
+We used multi-state survival analysis to examine this data because there are key changes that happen over time during a patient's ICU stay that must be accounted for. A simple cross-sectional analysis, e.g., examining the association between a patient experiencing any prone position (yes/no) and death (yes/no) using a chi-squared test or similar, over-simplifies the data and can introduce serious biases, such as the time-dependent bias @Beyersmann08. A simple approach also ignores the issue of competing risks, which can easily lead to flawed results and conclusions @Wolkewitz2014. In this case death and ICU discharge are competing events, because once a patient has experienced one, they cannot experience the other. 
+
+We used a multi-state model with four states (see previous figure). 
+Patients started in the prone or supine states, and could move between these states during their ECMO treatment. 
+We plotted the modelled number of patients in each state using the methods described in @Hazard2020. 
+We used a parametric survival model using a Weibull model to examine the hazards of moving to the death or discharge state, and whether this depending on prone positioning whilst adjusting for potential confounders. We also adjusted for each site using a random intercept, which allows sites to vary in their baseline risks.
+
+A key concern was confounders of prone position, which would be variables that predict both: 1) whether a patient is moved to a prone position, 2) the outcomes of death or discharge. To investigate this we used a survival model for time to prone position and included characteristics of the patients that we expected to influence whether they moved into a prone position during their stay. 
+
+We used summary statistics to describe the sample of patients, using percentages for categorical variables, and medians and inter-quartile ranges for continuous variables.
+
+The model estimates were made using a Bayesian framework and so results are presented using a 95% credible interval instead of the more familiar 95% confidence interval. A 95% credible interval has a 95% probability of containing the estimate of interest, whereas a 95% confidence interval has a much more cumbersome interpretation. We avoid presenting p-values as there are often misinterpreted [@Goodman2008]. Instead we focus on the size of the estimated effects and their 95% credible intervals, which are more clinically relevant.
+
+To verify our parametric survival models we also fitted non-parametric Cox models to verify that they gave similar hazard ratios and confidence intervals.
+
+We used `r s$R.version$version.string` for all analyses. The cumulative incidence models were fitted using the 'cmprsk' package [@cmprsk].
+All the R code used in the analysis is available here: https://github.com/agbarnett/covid_cccc. 
+
+<!--- To check: Patients were administratively censored if they were still in ICU when the data were extracted (31 October 2020). --->
+
+<!--- A good recent introduction to survival analysis is @Andersen2020. --->
+
+
+### Addition details for a methods appendix
+
+There was a small amount of missing data for BMI (n = `sum(is.na(my.data$bmi))`) and prone position prior to ECMO (n = `sum(is.na(my.data$ecmo_prone_before))`), and these missing values were imputed using multiple imputation in the Bayesian model [@Lunn12]. We used a flat beta prior for the binary variable of prone position prior to ECMO, and a normal distribution prior for body mass index with a mean of 30 kg/m2 and standard deviation of [x]. 
+
+# Appendices
+
+These appendices contain additional results and checks of the models. These could be appendices to the paper.
+
+## Site effects
+
+Random effects for sites from the survival models.
+
+##### Site effects (prone position)
+
+```{r, fig.width=5, fig.height=7}
+# get site estimates
+centres = bugs_extract(inbugs=bugs_results_prone, var='^centre', exp=TRUE, arrange=TRUE) %>% # from 99_functions.R
+  mutate(over = as.numeric(lower>1) + 1) # for colouring estimats
+# annotation
+labels = data.frame(row=0, mean=1, lower=0, upper=0, over=1, label=c('Increased hazard','Decreased hazard'))
+# plot
+cplot = ggplot(data=centres, aes(x=row, y=mean, ymin=lower, ymax=upper, col=factor(over)))+
+  geom_hline(lty=2, yintercept=1)+
+  scale_color_manual(NULL, values=c('cyan4','dark red'))+
+  geom_point()+
+  scale_y_log10()+
+  scale_x_continuous(breaks=NULL, labels = NULL, limits=c(0,M), expand=c(0.01,0.01))+
+  geom_errorbar(width=0)+
+  geom_text(data=labels, size=3, aes(x=row, y=mean, label=label), col='black', hjust=c(-0.1, 1.1))+
+  xlab('')+
+  ylab('Hazard ratio')+
+  coord_flip()+
+  theme_bw()+
+  theme(legend.position = 'none',
+    panel.grid.minor.y = element_blank(), 
+    panel.grid.major.y = element_blank())
+cplot
+```
+
+The plot shows the mean hazard ratio per site (circle) and 95% credible interval (horizontal line) for the `r n_sites` sites. The dotted vertical line is at a hazard ratio of 1 and indicated no change in hazard. Sites below the line have a decreased hazard of prone position, whilst sites above the line have an increased hazard. Sites with a lower limit above the line have been coloured red. Sites have been ordered using their mean hazard ratio. 
+The wide credible intervals indicate large uncertainty in most sites, and this is because of the small number of patients in most sites. The hazard ratio is on a log scale (base 10).
+
+There are `r sum(centres$over==2)` sites that have a relatively large hazard ratio for putting patients in prone position. This could be because prone positioning is an accepted practice at those sites.
+
+##### Site effects (death and discharge)
+
+```{r, fig.width=5, fig.height=7}
+# get centre estimates
+centres_death = bugs_extract(inbugs=bugs_results_death, var='^centre', exp=TRUE) %>% # from 99_functions.R
+  mutate(type = 1)
+# annotation
+centres_discharge = bugs_extract(inbugs=bugs_results_discharge, var='^centre', exp=TRUE) %>% # from 99_functions.R
+  mutate(type = 2)
+# annotation
+labels = data.frame(row=0, mean=1, lower=0, upper=0, label=c('Increased hazard','Decreased hazard'))
+# combine estimates
+centres = bind_rows(centres_death, centres_discharge) %>%
+  group_by(row) %>%
+  mutate(mean_hr = mean(mean)) %>% # calculate average HR
+  ungroup() %>%
+  mutate(order = as.numeric(as.factor(mean_hr)),
+         order = ifelse(type==2, order+0.2, order))  # jitter
+# plot
+cplot = ggplot(data=centres, aes(x=order, y=mean, ymin=lower, ymax=upper, col=factor(type)))+
+  geom_hline(lty=2, yintercept=1)+
+  geom_point()+
+  scale_y_log10()+
+  scale_x_continuous(breaks=NULL, labels = NULL, limits=c(0,M+0.2), expand=c(0.01,0.01))+
+  scale_color_manual(NULL, values=c('indianred','skyblue'), labels=c('Death','Discharge'))+
+  geom_errorbar(width=0)+
+  geom_text(data=labels, size=3, aes(x=row, y=mean, label=label), col='black', hjust=c(-0.1, 1.1))+
+  xlab('')+
+  ylab('Hazard ratio')+
+  coord_flip()+
+  theme_bw()+
+  theme(panel.grid.minor.y = element_blank(), panel.grid.major.y = element_blank())
+cplot
+```
+
+The hazard ratio axis is on log scale (base 10). Each row is a site and there are two estimates per site: one for death and one for discharge.
+
+There was more variability between sites in the hazard of discharge than the hazard of death.
+
+## Clustering by patient
+
+TO DO.
+
+## Baseline hazards
+
+Plots of the estimated baseline hazard function from the Weibull survival models.
+Say why this is useful. Cite Altman.
+
+#### a) Time to prone position
+
+```{r}
+# times to predict over:
+x = c(0.5, 1:(censor_day/2)) # only need half of censor time
+# winbugs estimates
+r = bugs_results_prone$sims.list$r # from MCMC
+mu = exp(bugs_results_prone$sims.list$int) # log-link
+mat = matrix(data=0, nrow=length(r), ncol=length(x))
+# alternative notation (from Wikipedia)
+for (i in 1:length(r)){ # loop through MCMC
+  mat[i,] = mu[i]*r[i]*(x^(r[i]-1))
+}
+f = data.frame(x=x, hazard = colMeans(mat), lower=apply(mat, 2, quantile, probs=0.025), upper=apply(mat, 2, quantile, probs=0.975))
+hazplot = ggplot(f, aes(x=x, y=hazard, ymin=lower, ymax=upper))+
+  geom_ribbon(alpha=0.2)+
+  geom_line()+
+  xlab('Days')+
+  ylab('Hazard function')+
+  theme_bw()
+hazplot
+```
+
+The black line is the mean hazard function and the grey area is the 95% credible interval.
+The hazard of prone position is highest in the first few days and then sharply declines. This matches the data, as most patients are prone on day zero, or get moved to prone soon after being on ECMO.
+
+#### b) Time to discharge and death
+
+```{r}
+# times to predict over:
+x = c(0.5, 1:(censor_day/2)) # only need half of censor time
+## a) discharge
+# winbugs estimates
+r = bugs_results_discharge$sims.list$r # from MCMC
+mu = exp(bugs_results_discharge$sims.list$int) # log-link
+mat = matrix(data=0, nrow=length(r), ncol=length(x))
+# alternative notation (from Wikipedia)
+for (i in 1:length(r)){ # loop through MCMC
+  mat[i,] = mu[i]*r[i]*(x^(r[i]-1)) # hazard function
+}
+f1 = data.frame(type=2, x=x, hazard = colMeans(mat), lower=apply(mat, 2, quantile, probs=0.025), upper=apply(mat, 2, quantile, probs=0.975))
+## b) death
+# winbugs estimates
+r = bugs_results_death$sims.list$r # from MCMC
+mu = exp(bugs_results_death$sims.list$int) # log-link
+mat = matrix(data=0, nrow=length(r), ncol=length(x))
+# alternative notation (from Wikipedia)
+for (i in 1:length(r)){ # loop through MCMC
+  mat[i,] = mu[i]*r[i]*(x^(r[i]-1)) # hazard function
+}
+f2 = data.frame(type=1, x=x, hazard = colMeans(mat), lower=apply(mat, 2, quantile, probs=0.025), upper=apply(mat, 2, quantile, probs=0.975))
+f = bind_rows(f1, f2) %>%
+  mutate(type.nice = factor(type, levels=1:2, labels=c('Death','Discharge')))
+hazplot = ggplot(f, aes(x=x, y=hazard, ymin=lower, ymax=upper))+
+  geom_ribbon(alpha = 0.2)+
+  geom_line()+
+  scale_color_manual(NULL, values=c('indianred','skyblue'), labels=c('Death','Discharge'))+
+  xlab('Days')+
+  ylab('Hazard function')+
+  theme_bw()+
+  facet_wrap(~type.nice, scales='free_y')
+hazplot
+```
+
+The hazard of discharge increases greatly over time. The hazard of death also increases over time, but with a far shallower slope.
+
+### Alternative Cox survival models
+
+Here we use non-parametric Cox models to confirm the results from the parametric Weibull survival models.
+These Cox models do not account for correlated results from the same patient, but they do account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
+
+The table shows the mean hazard ratios (HRs) and 95% confidence intervals for death and discharge.
+
+```{r}
+# a) discharge
+days = ifelse(is.na(for_discharge$days)==TRUE, for_discharge$cens, for_discharge$days)
+bmi = ifelse(is.na(for_discharge$bmi)==TRUE, 0, for_discharge$bmi) # simple imputation of mean
+# weibull
+m_disch = survreg(Surv(days, event=for_discharge$cens==0, type='right') ~ for_discharge$sex + for_discharge$age +  for_discharge$calendar_time + bmi + for_discharge$prone + cluster(for_discharge$site_num))
+# cox
+c_disch = coxph(Surv(days, event=for_discharge$cens==0, type='right') ~ for_discharge$sex + for_discharge$age +  for_discharge$calendar_time + bmi + for_discharge$prone + cluster(for_discharge$site_num))
+ests_disch = tidy(c_disch, conf.int = TRUE, exponentiate = TRUE) %>%
+  mutate(
+    estimate = roundz(estimate, 2),
+    conf.low = roundz(conf.low, 2),
+    conf.high = roundz(conf.high, 2),
+    CI = paste(conf.low, ' to ', conf.high)) %>%
+  select(estimate, CI) %>%
+  rename('HR2' = 'estimate',
+         'CI2' = 'CI')
+# b) death
+days = ifelse(is.na(for_death$days)==TRUE, for_death$cens, for_death$days)
+bmi = ifelse(is.na(for_death$bmi)==TRUE, 0, for_death$bmi)
+# weibull
+m_death = survreg(Surv(days, event=for_death$cens==0, type='right') ~ bmi + for_death$age + for_death$sex + for_death$calendar_time + for_death$prone + cluster(for_death$site_num))
+# cox
+c_death = coxph(Surv(days, event=for_death$cens==0, type='right') ~ bmi + for_death$age + for_death$sex + for_death$calendar_time + for_death$prone + cluster(for_death$site_num))
+ests_death = tidy(c_death, conf.int = TRUE, exponentiate = TRUE) %>%
+  mutate(
+    estimate = roundz(estimate, 2),
+    conf.low = roundz(conf.low, 2),
+    conf.high = roundz(conf.high, 2),
+    CI = paste(conf.low, ' to ', conf.high, sep = '')) %>%
+  select(term, estimate, CI) %>%
+  rename('HR1' = 'estimate',
+         'CI1' = 'CI')
+## nice table
+for_tab = bind_cols(ests_death, ests_disch) %>%
+  mutate(term = str_remove(string=term, pattern='for_death\\$'))
+#
+header = read.table(header=TRUE, stringsAsFactors = FALSE, sep="!", text='
+col_keys!colB!colA
+term! !Variable
+HR1!Death!HR
+CI1!Death!95% CI
+HR2!Discharge!HR
+CI2!Discharge!95% CI
+')
+#
+ftab = flextable(for_tab) %>%
+  set_header_df(mapping = header, key = "col_keys") %>%
+  merge_h(part = "header", i = 1) %>%
+  theme_box() %>%# nice theme
+  align(align='center', part='all') %>%# centre text
+  autofit()
+ftab
+```
+
+Prone position strongly reduces the hazard of death. 
+
+#### Check of proportional hazards assumption for Cox models
+
+```{r}
+prop_disch = cox.zph(c_disch)
+prop_death = cox.zph(c_death)
+for_table = bind_rows(as.data.frame(prop_disch$table), as.data.frame(prop_disch$table), .id='outcome') %>%
+  mutate(Variable = row.names(.),
+         Variable = str_remove_all(string=Variable, pattern='for_discharge\\$|\\.|[0-9]'), # tidy names
+         chisq = round(chisq*100, 0)/100,
+         p = format.pval(p, eps=0.001, digits=3),
+         outcome = factor(as.numeric(outcome), levels=1:2, labels=c("Discharge",'Death'))) %>%
+  select(Variable, everything())
+ftab = flextable(for_table) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+The table above shows no clear concern about the proportional hazards assumption using a Cox model. 
+
+#### References
+
