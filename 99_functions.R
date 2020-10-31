@@ -886,6 +886,7 @@ desc_table_cat = function(indata, vars, group_var, heading){
     tidyr::gather(key='Variable', value='Value', -pin, -group_var) %>%
     mutate( # explicit missing:
       Value = ifelse(Value=='', 'Missing', Value),
+      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value),
       # nice variable names:
       Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
       Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable)) %>%
@@ -899,6 +900,7 @@ desc_table_cat = function(indata, vars, group_var, heading){
     tidyr::gather(key='Variable', value='Value', -pin) %>%
     mutate( # explicit missing:
       Value = ifelse(Value=='', 'Missing', Value),
+      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value),
       # nice variable names:
       Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
       Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable)) %>%
