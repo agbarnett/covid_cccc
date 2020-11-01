@@ -25,6 +25,7 @@ options(dplyr.summarise.inform = FALSE)
 library(mstate)
 library(stringr)
 library(flextable)
+library(lme4)
 library(R2WinBUGS)
 bugs_location = "c:/Program Files/WinBUGS14" # location of the file WinBUGS14.exe
 library(broom) 
@@ -104,7 +105,18 @@ daily_ecmo = left_join(for_join, daily, by=c('pin','date_daily')) %>%
 ```{r, include=FALSE}
 ### prepare data for survival analysis ###
 ## ---- transitions
-my.data = time_transitions_ecmo_prone(indata=patients, censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
+#my.data = time_transitions_ecmo_prone(indata=patients, censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
+#  select(pin, from, to, start, end, date_ecmo, age, any_prone, sex, bmi, site_name, site_num, country, #ecmo_prone_before) %>%
+#  rename(id = pin, # rename to suit Martin's use
+#         entry = start,
+#         exit = end)
+
+#
+my.data = time_transitions(indata=patients, 
+                           start_state='date_ecmo',
+                           int_state = 'prone_start',
+                           int_state_end = 'prone_end', 
+                           censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
   select(pin, from, to, start, end, date_ecmo, age, any_prone, sex, bmi, site_name, site_num, country, ecmo_prone_before) %>%
   rename(id = pin, # rename to suit Martin's use
          entry = start,
@@ -317,7 +329,7 @@ We do not have the exact calendar time because dates have been scrambled by arou
 The figure below shows the four states in the multi-state survival model. Patients start in the "ECMO & supine" state on the day they begin ECMO. Patients in the prone position on their first day of ECMO start in the "ECMO & Prone" state. Patients can move from Supine to Prone, and back from Prone to Supine.
 
 ```{r}
-states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge')
+states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge\nfrom ICU')
 # Matrix of joins between states:
 M = matrix(data=c(
   2,1,
@@ -487,6 +499,7 @@ ftab
 ```
 
 Older patients have a reduced hazard of being put in a prone position (HR = `r beta$mean[2]`).
+Patients with a higher BMI have a reduced hazard of being put in a prone position (HR = `r beta$mean[4]`).
 
 There were `r sum(for_prone$to=='cens')` patients who were administratively censored, meaning they were not yet discharged or dead by the end of the study.
 
@@ -625,7 +638,7 @@ plot(pt_fc_2, from = 1,  ord = c(4,2,1,3), type= "filled",cols = c("khaki1","ind
      cex.lab = 1.25, legend = c("", "", "", ""),
      main= NULL, axes=FALSE)
 text(0, 0.62, "ECMO &\nsupine", cex = 1, adj=c(-0.1,0.5))
-text(0, 0.2, "ECMO &\nprone", cex = 1, adj=c(-0.1,0.5))
+text(0.01, 0.14, "ECMO &\nprone", cex = 1, adj=c(-0.1,0.5))
 text(censor_day, 0.9, "Discharge", cex = 1, adj=c(1.1,0.5))
 text(censor_day, 0.15, "Death", cex = 1, adj=c(1.1,0.5)) 
 # better x-axis ticks:
@@ -672,7 +685,7 @@ g = ggcompetingrisks(cum_inc,
 # output modified plot
 gmod = g + geom_line(size = 1.05) + # make lines thicker
   scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
-  scale_y_continuous(breaks=seq(0, 0.7, 0.1))+
+  scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
   scale_colour_manual(name="State moved to:", values=c(4,2,3,1), labels=c("Supine","Prone","Discharge",'Death')) +  # change labels
   theme(
     panel.grid.major = element_line(colour=grey(0.8)),
@@ -839,9 +852,9 @@ censored = group_by(my.data, id) %>%
   filter(to == 'cens') # admin censored
 ```
 
-Prone position greatly reduces the hazard of death (HR = `r for_table$mean1[5]`). The estimated probability that prone position is associated with a decreased hazard of death is `r round(pval_prone*10000)/10000`, meaning the model strongly supports this association. 
+Prone position somewhat reduces the hazard of death (HR = `r for_table$mean1[5]`). 
 
-Older age decreases the hazard of discharge (HR = `r for_table$mean2[2]`), which increases the length of time on ECMO.
+Older age increases the hazard of death (HR = `r for_table$mean1[2]`). Older age decreases the hazard of discharge (HR = `r for_table$mean2[2]`), which increases the length of time on ECMO.
 Calendar time has a strong effect on discharge (HR = `r for_table$mean2[3]`), with more days on ECMO (reduced discharge hazard) over calendar time. 
 
 There were `r nrow(censored)` patients who were administratively censored, meaning they were not yet discharged or dead by the end of the study.
@@ -897,7 +910,7 @@ table_nums(name="crr_hazards", "Hazard ratios and 95% confidence intervals using
 ftable
 ```
 
-Prone position strongly decreases the probability of death and increases the probability of discharge.
+Prone position decreases the probability of death and discharge.
 
 ##### Plot of model predictions for cumulative regression
 
@@ -921,7 +934,7 @@ pred_plot = ggplot(data=pred, aes(x=days, y=crr, col=factor(prone)))+
   scale_color_manual('Prone', labels=c('No','Yes'), values=c('cyan4','darkorange'))+
   xlab('Days since ECMO started')+
   ylab('Cumulative probability')+
-  theme(legend.position = c(0.85, 0.15))+
+  theme(legend.position = c(0.15, 0.85))+
   facet_wrap(~type_nice)
 figure_nums(name="crr_plot", "Plot of predicted cumulative probabilities of death and discharge over time for cumulative regression model for patients in prone and supine position.") # title
 pred_plot
@@ -1077,7 +1090,6 @@ daily_plot = left_join(to_keep, daily, by=c('id'='pin')) %>%
   select(id, date_daily, ecmo_start, prone_start, diff, prone_effect, eotd_peep) %>%
   filter(!is.na(eotd_peep)) # remove results with missing outcome
 # model within person change
-library(lme4)
 model = lmer(eotd_peep ~ diff + prone_effect + (1|id), data=daily_plot) # just random intercept
 newdata = data.frame(id=daily_plot$id[1], diff=seq(-14,14,1)) %>%
   mutate(prone_effect = ifelse(diff<0, 0, diff))
@@ -1378,7 +1390,7 @@ table_nums(name="hr_cox", "Hazard ratios and 95% credible intervals for death an
 ftab 
 ```
 
-Prone position strongly reduces the hazard of death. 
+Prone position reduces the hazard of death and discharge. 
 
 #### Checking for influential patients
 
@@ -1393,18 +1405,39 @@ influence_discharge = ggcoxdiagnostics(fit=cox_models$discharge_model, sline=FAL
 influence_discharge
 ```
 
+There is one influential patient for prone for the model examining discharge. This is the one patient who was discharged in prone position. Without that patient the hazard of discharge is much greater in 
+
+```{r}
+# look at influential observation(s)
+index = filter(influence_discharge$data, covariate=='prone', abs(res) >= 0.6) %>% pull(xval)
+to_table = cox_models$discharge_data[index,] %>%
+  select(id, site, sex, age, bmi, prone, days, cens) %>%
+  mutate(
+    cens = ifelse(cens==0, 'No', 'Yes'), # nicer labels for table
+    prone = ifelse(prone==0, 'No', 'Yes'),
+    sex = ifelse(sex==1, 'Male', 'Female'),
+    days = round(days),
+    age = (age*10)+50, # back-transform
+    bmi = (bmi*5)+30,
+    bmi =round(bmi*10)/10) %>%
+  rename('censored' = 'cens')
+ftab = flextable(to_table) %>%
+  autofit() %>%
+  theme_box()
+ftab
+```
+
 ```{r}
 figure_nums(name="inf_death", "Influential observations for the Cox survival model of death", level=2) # title
-# test of influential observations
+# test of influential observation(s)
 influence_death = ggcoxdiagnostics(fit=cox_models$death_model, sline=FALSE, type = 'dfbeta', linear.predictions = FALSE, ggtheme = theme_bw())
 influence_death
 ```
 
-
-There are a few influential patients for prone for the model examining deaths, although the size is relatively small at around 0.1, meaning the estimated reduced risk of death would be larger without these patients. For comparison the estimate for prone with all the data is `r round(cox_models$death_model$coefficients[5]*100)/100`.
+There are some influential patients for prone for the model examining deaths, although the size is relatively small at around 0.1, meaning the estimated reduced risk of death would be larger without these patients. For comparison the estimate for prone with all the data is `r round(cox_models$death_model$coefficients[5]*100)/100`.
 
 ```{r}
-# look at influential observations
+# look at influential observation(s)
 index = filter(influence_death$data, covariate=='prone', abs(res) >= 0.1) %>% pull(xval)
 to_table = cox_models$death_data[index,] %>%
   select(id, site, sex, age, bmi, prone, days, cens) %>%
@@ -1429,8 +1462,8 @@ These are all patients in the prone position who died in relatively short times 
 
 ```{r}
 prop_disch = cox.zph(run_cox_models(in_discharge = for_discharge, in_death = for_death)$discharge_model)
-prop_death = cox.zph(run_cox_models(in_discharge = for_discharge, in_death = for_death)$death_model)
-for_table = bind_rows(as.data.frame(prop_disch$table), as.data.frame(prop_disch$table), .id='outcome') %>%
+prop_death = cox.zph(run_cox_models(in_discharge = for_death, in_death = for_death)$death_model)
+for_table = bind_rows(as.data.frame(prop_disch$table), as.data.frame(prop_death$table), .id='outcome') %>%
   mutate(Variable = row.names(.),
          Variable = str_remove_all(string=Variable, pattern='in_discharge\\$|\\.|[0-9]'), # tidy names
          chisq = round(chisq*100, 0)/100,
@@ -1446,6 +1479,7 @@ ftab
 ```
 
 The table above shows no clear concern about the proportional hazards assumption using a Cox model. 
+The only variable that may be worth investigating is the effect of age on discharge.
 
 ### Leave one country out sensitivity analysis
 
@@ -1490,7 +1524,7 @@ grid.arrange(leave_plot1, leave_plot2, ncol=2)
 ```
 
 The plot shows the mean hazard ratio (dot) and 95% confidence interval.
-The estimates remain mostly similar regardless of which country is left-out, hence the results are not reliant on patients from one country. The largest change is when the USA is left-out as the effect of prone on discharge becomes stronger.
+The estimates change when the USA is left out. This is because the one very influential patient is from the USA.
 
 ## Checking convergence for Bayesian models
 

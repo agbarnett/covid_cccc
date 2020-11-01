@@ -109,10 +109,10 @@ time_transitions = function(indata, check=TRUE, censor_day = NA){
   
   # exclude those with no event dates (may have ICU entry date)
   index = is.na(indata$date_mechanical_ventilation) & 
-    is.na(indata$date_death) &
+  is.na(indata$date_death) &
   is.na(indata$date_discharge) &
   is.na(indata$last_date)&
-    is.na(indata$date_mech_vent_discontinued)
+  is.na(indata$date_mech_vent_discontinued)
   n_excluded = sum(index)
   indata = indata[!index,]
 
@@ -412,7 +412,7 @@ time_transitions_ecmo = function(indata, check=TRUE, censor_day = NA){
 } # end of function
 
 ### function to make transitions times for ECMO with prone as an intermediate state
-# addition option with prone_time_dependent = TRUE to add prone as a cumulative exposire
+# addition option with prone_time_dependent = TRUE to add prone as a cumulative exposure
 time_transitions_ecmo_prone = function(indata, 
                                        check = TRUE, 
                                        censor_day = NA, 
@@ -437,7 +437,7 @@ time_transitions_ecmo_prone = function(indata,
   # date fixes
   indata = mutate(indata,
           # if prone end before ECMO then blank prone start and end (prone happened before ECMO started)
-          prone_blank = ifelse(prone_end < date_ecmo, 1, 0),
+          prone_blank = ifelse(prone_end <= date_ecmo, 1, 0),
           prone_start = ifelse(prone_blank == 1, NA, prone_start),
           prone_end = ifelse(prone_blank == 1, NA, prone_end),
           # if prone start before ECMO (and prone end after) then change to ECMO date (i.e., assume prone on arrival)
@@ -445,11 +445,11 @@ time_transitions_ecmo_prone = function(indata,
           # if last date is before ecmo start then move last date
           last_date  = ifelse(last_date < date_ecmo, date_ecmo, last_date),
           # if date prone end is same as death or discharge then delete prone end date
-          prone_end = ifelse(prone_end==date_discharge & !is.na(prone_end), NA, prone_end),
-          prone_end = ifelse(prone_end==date_death & !is.na(prone_end), NA, prone_end),
+          prone_end = ifelse(prone_end==date_discharge & !is.na(prone_end) & !is.na(date_discharge), NA, prone_end), # error was here
+          prone_end = ifelse(prone_end==date_death & !is.na(prone_end) & !is.na(date_death), NA, prone_end),
           # if date ECMO end is same as death or discharge then delete ECMO end date
-          ecmo_end = ifelse(ecmo_end==date_discharge & !is.na(ecmo_end), NA, ecmo_end),
-          ecmo_end = ifelse(ecmo_end==date_death& !is.na(ecmo_end), NA, ecmo_end),
+          ecmo_end = ifelse(ecmo_end==date_discharge & !is.na(ecmo_end) & !is.na(date_discharge), NA, ecmo_end),
+          ecmo_end = ifelse(ecmo_end==date_death& !is.na(ecmo_end) & !is.na(date_death), NA, ecmo_end),
           # reformat dates
           prone_start = as.Date(prone_start, origin='1970-01-01'),
           prone_end = as.Date(prone_end, origin='1970-01-01'),
@@ -933,3 +933,242 @@ desc_table_cat = function(indata, vars, group_var, heading){
     autofit()
   return(ftab)
 }
+
+### function to make transitions times with a general intermediate state
+time_transitions = function(indata, 
+                            start_state = 'date_icu', # starting date/state
+                            int_state = 'date_mechanical_ventilation', # name of intermediate state
+                            int_state_end = NULL, # name of intermediate state end (optional)
+                            check = TRUE, 
+                            censor_day = NA){
+  
+  # State 0: Censored
+  # State 1: starting state (could be ICU admission or ECMO start)
+  # State 2: intermediate state
+  # State 3: Discharge
+  # State 4: Death
+  
+  # simple rename for starting state
+  index = names(indata) == start_state
+  names(indata)[index] = 'date_start'
+  # simple rename for intermediate state
+  index = names(indata) == int_state
+  names(indata)[index] = 'date_int_state'
+  if(is.null(int_state_end) == FALSE){
+    index = names(indata) == int_state_end
+    names(indata)[index] = 'date_int_state_end'
+  }
+  
+  # exclude those with no event dates 
+  index1 = is.na(indata$date_int_state) & 
+    is.na(indata$date_death) &
+    is.na(indata$date_discharge) &
+    is.na(indata$last_date)&
+    is.na(indata$date_int_state_end)
+  index2 = is.na(indata$date_start) # must have start date
+  index = index1 | index2
+  n_excluded = sum(index)
+  indata = indata[!index,]
+  
+  # if intermediate state stopped is same as death or discharge then delete intermediate end date
+  if(is.null(int_state_end) == FALSE){
+    indata = mutate(indata,
+                    date_int_state_end = ifelse(date_int_state_end == date_discharge & !is.na(date_discharge), NA, date_int_state_end),
+                    date_int_state_end = ifelse(date_int_state_end == date_death & !is.na(date_death), NA, date_int_state_end),
+                    date_int_state_end = as.Date(date_int_state_end, origin='1970-01-01'))
+  }
+  
+  # a) times to death
+  to_death = filter(indata, is.na(date_death) == FALSE) # must have date of death
+  if(is.null(int_state_end) == TRUE){ # if no intermediate state
+    to_death = mutate(to_death, 
+                      start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start), # start from intermediate or admission
+                      from = ifelse(is.na(date_int_state) == FALSE, 2, 1)) # if intermediate ended then back to 1
+  }
+  if(is.null(int_state_end) == FALSE){ # if intermediate state
+    to_death = mutate(to_death, 
+                      start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start),# start from intermediate or admission ...
+                      start_date = ifelse(is.na(date_int_state_end) == FALSE, date_int_state_end, start_date), # ... update to intermediate end if it's there
+                      from = case_when(
+                        is.na(date_int_state) == TRUE & is.na(date_int_state_end) == TRUE ~ 1, # not intermediate
+                        is.na(date_int_state) == FALSE & is.na(date_int_state_end) == TRUE ~ 2, # still in intermediate
+                        is.na(date_int_state) == TRUE & is.na(date_int_state_end) == FALSE ~ 1, # back to start
+                        is.na(date_int_state) == FALSE & is.na(date_int_state_end) == FALSE ~ 1 # back to start
+                      ))
+  }
+  to_death = mutate(to_death, 
+                    start_date = as.Date(start_date, origin='1970-01-01'), 
+                    to = 4, # death
+                    start = as.numeric(start_date - date_start), # start time in days
+                    end = as.numeric(date_death - date_start)) # end time in days (to death)
+  
+  # b) times to discharge
+  to_discharge = filter(indata, is.na(date_death) == TRUE, is.na(date_discharge) == FALSE)  # must have no death date but discharge date
+  if(is.null(int_state_end) == TRUE){ # if no intermediate state
+    to_discharge = mutate(to_discharge, 
+                          start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start), # start from intermediate or admission
+                          from = ifelse(is.na(date_int_state) == FALSE, 2, 1)) # if intermediate ended then back to 1
+  }
+  if(is.null(int_state_end) == FALSE){ # if intermediate state
+    to_discharge = mutate(to_discharge, 
+                          start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start),# start from intermediate or admission ...
+                          start_date = ifelse(is.na(date_int_state_end) == FALSE, date_int_state_end, start_date), # ... update to intermediate end if it's there
+                          from = case_when(
+                            is.na(date_int_state) == TRUE & is.na(date_int_state_end) == TRUE ~ 1, # not intermediate
+                            is.na(date_int_state) == FALSE & is.na(date_int_state_end) == TRUE ~ 2, # still in intermediate
+                            is.na(date_int_state) == TRUE & is.na(date_int_state_end) == FALSE ~ 1, # back to start
+                            is.na(date_int_state) == FALSE & is.na(date_int_state_end) == FALSE ~ 1 # back to start
+                          ))
+  }
+  to_discharge = mutate(to_discharge, 
+                        start_date = as.Date(start_date, origin='1970-01-01'), 
+                        to = 3, # discharge
+                        start = as.numeric(start_date - date_start), # start time in days
+                        end = as.numeric(date_discharge - date_start)) # end time in days (to discharge)
+  
+  # c) times to censored
+  to_censored = filter(indata, is.na(date_death) == TRUE, is.na(date_discharge) == TRUE) 
+  if(is.null(int_state_end) == TRUE){ # if no intermediate state
+    to_censored = mutate(to_censored, 
+                         start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start), # start from intermediate or admission
+                         from = ifelse(is.na(date_int_state) == FALSE, 2, 1)) # if intermediate ended then back to 1
+  }
+  if(is.null(int_state_end) == FALSE){ # if intermediate state
+    to_censored = mutate(to_censored, 
+                         start_date = ifelse(is.na(date_int_state) == FALSE, date_int_state, date_start),# start from intermediate or admission ...
+                         start_date = ifelse(is.na(date_int_state_end) == FALSE, date_int_state_end, start_date), # ... update to intermediate end if it's there
+                         from = case_when(
+                           is.na(date_int_state) == TRUE & is.na(date_int_state_end) == TRUE ~ 1, # not intermediate
+                           is.na(date_int_state) == FALSE & is.na(date_int_state_end) == TRUE ~ 2, # still in intermediate
+                           is.na(date_int_state) == TRUE & is.na(date_int_state_end) == FALSE ~ 1, # back to start
+                           is.na(date_int_state) == FALSE & is.na(date_int_state_end) == FALSE ~ 1 # back to start
+                         ))
+  }
+  to_censored = mutate(to_censored, 
+                       start_date = as.Date(start_date, origin='1970-01-01'), 
+                       to = 0, # censored
+                       start = as.numeric(start_date - date_start), # start time in days
+                       end = as.numeric(last_date - date_start)) # end time in days (to discharge)
+  
+  # d) times to intermediate (from ICU)
+  to_intermediate = filter(indata, is.na(date_int_state) == FALSE) %>%
+    mutate(start_date = date_start,
+           start_date = as.Date(start_date, origin='1970-01-01'), 
+           from = 1, # Non-intermediate
+           to = 2, # intermediate
+           start = 0, 
+           end = as.numeric(date_int_state - date_start), # days to intermediate
+           end = ifelse(end < 0, 0, end)) # if negative assume ventilated on admission
+  
+  # e) times to non-intermediate (from intermediate)
+  if(is.null(int_state_end) == FALSE){ # if end date
+    to_non_intermediate = filter(indata, is.na(date_int_state_end) == FALSE) %>%
+      mutate(start_date = date_int_state,
+             end_date = date_int_state_end,
+             from = 2, # intermediate
+             to = 1, # non-intermediate
+             start = as.numeric(start_date - date_start), # days to intermediate start
+             end = as.numeric(end_date - date_start), # days to intermediate end
+             start = ifelse(start<0, 0, start)) # assume ventilated on arrival if negative
+  }
+  
+  # combine four/five transitions 
+  for_model = bind_rows(to_death, to_discharge, to_censored, to_intermediate)
+  if(is.null(int_state_end) == FALSE){ # if end date
+    for_model = bind_rows(for_model, to_non_intermediate)
+  }
+  for_model = mutate(for_model, start = ifelse(start < 0, 0, start)) # assume negative dates mean ventilated on arrival
+  
+  ## fixes because of same dates
+  # if move from transition to non-transition before start (so no transition)
+  index = with(for_model, from == 1 & to == 2 & end < 0)
+  for_model = for_model[!index,]
+  index = with(for_model, from == 2 & to == 1 & end < 0)
+  for_model = for_model[!index,]
+  # if non-intermediate to intermediate at time zero then assume intermediate on entry (so no transition)
+  index = with(for_model, from == 1 & to == 2 & start == 0 & end == 0)
+  for_model = for_model[!index,]
+  # if intermediate to non-intermediate at time zero then assume intermediate on entry (so no transition)
+  index = with(for_model, from == 2 & to == 1 & start == 0 & end == 0)
+  for_model = for_model[!index,]
+  
+  ## add half days
+  # add half to discharge if start and end are same
+  index = with(for_model, from == 1 & to == 2 & start == end)
+  for_model$end[index] = for_model$end[index] + 0.5
+  # add half to discharge if start and end are same
+  index = with(for_model, from == 2 & to == 1 & start == end)
+  for_model$end[index] = for_model$end[index] + 0.5
+  # add half to discharge if start and end are same
+  index = with(for_model, to == 3 & start == end)
+  for_model$end[index] = for_model$end[index] + 0.5
+  # add half to death if start and end are same
+  index = with(for_model, to == 4 & start == end)
+  for_model$end[index] = for_model$end[index] + 0.5
+  # add half to censored if start and end are same
+  index = with(for_model, to == 0 & start == end)
+  for_model$end[index] = for_model$end[index] + 0.5
+  
+  # remove impossible patients with obvious errors in dates
+  exclude = filter(for_model, start > end) 
+  for_model = filter(for_model,
+                     !pin %in% exclude$pin) %>%
+    arrange(pin, start, end)
+  
+  #remove any remaining NAs
+  index = with(for_model,is.na(from)|is.na(to)|is.na(start)|is.na(end))
+  for_model = for_model[!index,]
+  
+  # censor at a specified time (if it exists)
+  if(is.na(censor_day) >= FALSE){
+    for_model = filter(for_model, start < censor_day) %>% # only transitions before censor day
+      mutate(beyond = end > censor_day,
+             to = ifelse(beyond == TRUE, 0, to), # change state to censored
+             end = ifelse(beyond == TRUE, censor_day, end))
+  }
+  
+  # quick check
+  if(check == TRUE){
+    t1 = filter(for_model, from == 1, to == 2) %>%
+      sample_n(1)
+    t2 = filter(for_model, from == 1, to == 3) %>%
+      sample_n(1)
+    t3 = filter(for_model, from == 1, to == 4) %>%
+      sample_n(1)
+    t4 = filter(for_model, from == 2, to == 3) %>%
+      sample_n(1)
+    t5 = filter(for_model, from == 2, to == 4) %>%
+      sample_n(1)
+    t6 = filter(for_model, to == 0) %>%
+      sample_n(1)
+    t7 = filter(for_model, to == 1) %>%
+      sample_n(1)
+    test = bind_rows(t1, t2, t3, t4, t5, t6, t7)
+    ids = unique(test$pin)
+    cat('Original data:\n')
+    patient_test = filter(indata, pin %in% ids) %>%
+      select(pin, date_start, contains('date_int_'), date_discharge, date_death, last_date) %>%
+      arrange(pin)
+    print(patient_test)
+    cat('Transitions:\n')
+    transition_test = filter(for_model, pin %in% ids) %>%
+      select(pin, from, to, start, end)
+    print(transition_test)
+    
+  }
+  
+  # rename back
+  index = names(for_model) == 'date_start'
+  names(for_model)[index] = start_state
+  # simple rename for intermediate state
+  index = names(for_model) == 'date_int_state'
+  names(for_model)[index] = int_state
+  if(is.null(int_state_end) == FALSE){
+    index = names(for_model) == 'date_int_state_end'
+    names(for_model)[index] = int_state_end
+  }
+  
+  
+  return(for_model)
+} # end of function
+
