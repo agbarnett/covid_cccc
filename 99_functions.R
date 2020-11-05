@@ -99,7 +99,7 @@ blood_gases = function(before_var='ecmo_worst_pa_o2_6hr_before',
 
 
 ### function to make transitions times for mechanical ventilation as intermediate state
-time_transitions = function(indata, check=TRUE, censor_day = NA){
+time_transitions_mv = function(indata, check=TRUE, censor_day = NA){
   
   # State 0: Censored
   # State 1: ICU, non-MV
@@ -831,7 +831,15 @@ multistate_diagram = function(states, links, pos, arr.pos=0.5){
 
 ### Descriptive tables by group. # group_var must be "Yes" / "No"
 # a) for continuous variables
-desc_table_cont = function(indata, vars, group_var, heading){
+desc_table_cont = function(
+  indata, 
+  vars, 
+  group_var, 
+  var_levels,
+  heading,
+  autofit = TRUE,
+  include_total = TRUE # add total column or not
+){
     # simple rename
     index = names(indata) == group_var
     names(indata)[index] = 'group_var'
@@ -846,6 +854,7 @@ desc_table_cont = function(indata, vars, group_var, heading){
               IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
     select(group_var, Variable, Missing, Median, IQR)
     # total column
+    if(include_total==TRUE){
     tab_total = select(indata, pin, all_of(vars)) %>%
       tidyr::gather(key='Variable', value='Value', -pin) %>%
       group_by(Variable) %>%
@@ -857,27 +866,42 @@ desc_table_cont = function(indata, vars, group_var, heading){
       select(Variable, Missing, Median, IQR) %>%
       mutate(group_var = 'Total')
     tab = bind_rows(tab, tab_total)
-    # columns by group
-  columns = c('Variable','No_Missing','No_Median','No_IQR','Yes_Missing','Yes_Median','Yes_IQR','Total_Missing','Total_Median','Total_IQR')
-  ctab = tidyr::gather(tab, variable, value, -(group_var:Variable)) %>% # move stats into one column
+    }
+    # columns in the right order:
+    columns = c('Variable', paste(rep(var_levels, each=3), c('_Missing','_Median','_IQR'), sep=''))
+    if(include_total == TRUE){columns = c(columns, 'Total_Missing','Total_Median','Total_IQR')}
+    ctab = tidyr::gather(tab, variable, value, -(group_var:Variable)) %>% # move stats into one column
     tidyr::unite(temp, group_var, variable) %>%
     tidyr::spread(temp, value) %>%
     select(columns)
-  # table header
-  table_header <- data.frame(
-    col_keys = columns,
-    h1 = c('', rep(heading[1], 3), rep(heading[2], 3), rep('Total', 3)),
-    h2 = c('Variable','Missing','Median','IQR','Missing','Median','IQR','Missing','Median','IQR'),
-    stringsAsFactors = FALSE )
+    # table header
+    if(include_total == FALSE){
+      table_header <- data.frame(
+        col_keys = columns,
+        h1 = c('', rep(heading, each=3)),
+        h2 = c('Variable', rep(c('Missing','Median','IQR'), length(heading))))
+    }
+    if(include_total == TRUE){
+      table_header <- data.frame(
+        col_keys = columns,
+        h1 = c('', rep(heading, each=3), rep('Total', 3)),
+        h2 = c('Variable', rep(c('Missing','Median','IQR'), length(heading)+1)))
+    }
   ftab = flextable(ctab) %>% 
     set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
     merge_h(i=1, part = "header") %>% # merge "To" column headers
-    theme_box() %>%
-    autofit()
+    theme_box() 
+  if(autofit==TRUE){ftab = autofit(ftab)}
   return(ftab)
 }
+
 # b) for categorical variables
-desc_table_cat = function(indata, vars, group_var, heading){
+desc_table_cat = function(indata, 
+                          vars, 
+                          group_var, 
+                          var_levels = c('Yes','No'), # levels of the group variable
+                          include_total = TRUE, # add total column or not
+                          heading){
   # simple rename
   index = names(indata) == group_var
   names(indata)[index] = 'group_var'
@@ -896,6 +920,7 @@ desc_table_cat = function(indata, vars, group_var, heading){
     mutate(Percent = roundz(prop.table(n)*100,0)) %>% # calculate percent
     ungroup()
   # make table for totals
+  if(include_total == TRUE){
   tab_total = select(indata, pin, all_of(vars)) %>%
     tidyr::gather(key='Variable', value='Value', -pin) %>%
     mutate( # explicit missing:
@@ -911,8 +936,10 @@ desc_table_cat = function(indata, vars, group_var, heading){
     ungroup() %>%
     mutate(group_var = 'Total')
   tab = bind_rows(tab, tab_total) # add totals
-  # columns for prone vs any prone
-  columns = c('Variable','Value','No_n',"No_Percent",'Yes_n','Yes_Percent','Total_n','Total_Percent')
+  }
+  # columns in the right order:
+  columns = c('Variable','Value', paste(rep(var_levels, each=2), c('_n','_Percent'), sep=''))
+  if(include_total == TRUE){columns = c(columns, 'Total_n','Total_Percent')}
   ctab = tidyr::gather(tab, `n`, `Percent`, key='stat', value='result', -Variable, -group_var) %>% # move all stats to one column
     tidyr::unite(temp, group_var, stat) %>%
     group_by(Variable, Value) %>%
@@ -921,10 +948,18 @@ desc_table_cat = function(indata, vars, group_var, heading){
     ungroup() %>%
     mutate_if(is.character, tidyr::replace_na, replace = 0)
   # table header
+  if(include_total == FALSE){
   table_header <- data.frame(
     col_keys = columns,
-    h1 = c('', '', rep(heading[1], 2), rep(heading[2], 2), rep('Total', 2)),
-    h2 = c('Variable','Value','N','%','N','%','N','%'), stringsAsFactors = FALSE )
+    h1 = c('', '', rep(heading, each=2)),
+    h2 = c('Variable','Value', rep(c('N','%'), length(heading))))
+  }
+  if(include_total == TRUE){
+    table_header <- data.frame(
+      col_keys = columns,
+      h1 = c('', '', rep(heading, each=2), rep('Total', 2)),
+      h2 = c('Variable','Value', rep(c('N','%'), length(heading)+1)))
+  }
   ftab = flextable(ctab) %>% 
     set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
     merge_h(i=1, part = "header") %>% # merge "To" column headers
@@ -933,6 +968,20 @@ desc_table_cat = function(indata, vars, group_var, heading){
     autofit()
   return(ftab)
 }
+
+### function used by time_transitions to randomly sample data to check
+sample_transitions = function(indata, in_from, in_to){
+  transitions = filter(indata, from %in% in_from, to %in% in_to) 
+  if(nrow(transitions) > 0){
+    transitions = sample_n(transitions, 1)
+  }
+  if(nrow(transitions) ==0){
+    transitions = NULL
+  }
+  return(transitions)
+}
+
+
 
 ### function to make transitions times with a general intermediate state
 time_transitions = function(indata, 
@@ -960,11 +1009,19 @@ time_transitions = function(indata,
   }
   
   # exclude those with no event dates 
-  index1 = is.na(indata$date_int_state) & 
+  if(is.null(int_state_end) == TRUE){
+    index1 = is.na(indata$date_int_state) & 
     is.na(indata$date_death) &
     is.na(indata$date_discharge) &
-    is.na(indata$last_date)&
-    is.na(indata$date_int_state_end)
+    is.na(indata$last_date)
+  }
+  if(is.null(int_state_end) == FALSE){
+    index1 = is.na(indata$date_int_state) & 
+      is.na(indata$date_death) &
+      is.na(indata$date_discharge) &
+      is.na(indata$last_date)&
+      is.na(indata$date_int_state_end)
+  }
   index2 = is.na(indata$date_start) # must have start date
   index = index1 | index2
   n_excluded = sum(index)
@@ -1116,7 +1173,7 @@ time_transitions = function(indata,
     arrange(pin, start, end)
   
   #remove any remaining NAs
-  index = with(for_model,is.na(from)|is.na(to)|is.na(start)|is.na(end))
+  index = with(for_model, is.na(from)|is.na(to)|is.na(start)|is.na(end))
   for_model = for_model[!index,]
   
   # censor at a specified time (if it exists)
@@ -1129,20 +1186,13 @@ time_transitions = function(indata,
   
   # quick check
   if(check == TRUE){
-    t1 = filter(for_model, from == 1, to == 2) %>%
-      sample_n(1)
-    t2 = filter(for_model, from == 1, to == 3) %>%
-      sample_n(1)
-    t3 = filter(for_model, from == 1, to == 4) %>%
-      sample_n(1)
-    t4 = filter(for_model, from == 2, to == 3) %>%
-      sample_n(1)
-    t5 = filter(for_model, from == 2, to == 4) %>%
-      sample_n(1)
-    t6 = filter(for_model, to == 0) %>%
-      sample_n(1)
-    t7 = filter(for_model, to == 1) %>%
-      sample_n(1)
+    t1 = sample_transitions(for_model, in_from = 1, in_to = 2) 
+    t2 = sample_transitions(for_model, in_from = 1, in_to = 3) 
+    t3 = sample_transitions(for_model, in_from = 1, in_to = 4) 
+    t4 = sample_transitions(for_model, in_from = 2, in_to = 3) 
+    t5 = sample_transitions(for_model, in_from = 2, in_to = 4) 
+    t6 = sample_transitions(for_model, in_from = c(1,2), in_to = 4) 
+    t7 = sample_transitions(for_model, in_from = 1, in_to = c(2,3,4)) 
     test = bind_rows(t1, t2, t3, t4, t5, t6, t7)
     ids = unique(test$pin)
     cat('Original data:\n')
@@ -1167,7 +1217,6 @@ time_transitions = function(indata,
     index = names(for_model) == 'date_int_state_end'
     names(for_model)[index] = int_state_end
   }
-  
   
   return(for_model)
 } # end of function

@@ -1,0 +1,724 @@
+---
+title: "CCCC: ECMO and ICH patients (part 2)"
+author: "Adrian Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document: 
+      reference_docx: rmarkdown-styles-SAP-landscape.docx
+---
+  
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, comment='', dpi=400)
+options(width=1000) # Wide pages
+options(scipen=999) # avoid scientific presentation
+source('99_functions.R')
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(broom)
+library(R2WinBUGS)
+bugs_location = "c:/Program Files/WinBUGS14" # location of the file WinBUGS14.exe
+library(cmprsk) # for competing risks
+library(survminer) # for nice plots of competing risks; also test of influential values
+library(flextable) # for nice tables
+library(captioner)
+table_nums <- captioner(prefix = "Table", levels=2, type = c("n", "c")) # number and character
+figure_nums <- captioner(prefix = "Figure", levels=2, type = c("n", "c"))
+#library(broom)
+
+# graphics things:
+library(diagram)
+library(ggplot2)
+theme_set(theme_bw())
+library(ggupset)  # to plot combination of symptoms
+g.theme = theme_bw() + theme(panel.grid.minor = element_blank())
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#999999", "#CC79A7")
+
+## get the data
+source = 'real_data'
+source = 'dummy_data'
+if(source == 'dummy_data'){
+  load(file='data/COVID_Data_stroke_dummy.RData') # from 0_read_data.R, dummy data
+  # fixes with stroke
+  patients = mutate(patients,
+          stroke_group = ifelse(is.na(complication_stroke_date)==TRUE, 'None', stroke_group), # blank stroke group for those with no date
+          stroke_group = ifelse(is.na(complication_stroke_date)==FALSE, sample(c('Hemorrhage','Ischemic','Other/Unknown','None'), size=n(), replace=TRUE), stroke_group) # randomly add stroke group for those with a date
+                    )
+}
+if(source == 'real_data'){
+  load(file='data/COVID_Data_stroke.RData') # from 0_read_data.R
+}
+
+# make last possible date based on database freeze
+last_possible = as.Date(paste(data_date$day, data_date$month, '2020', sep='-'), format='%d-%b-%Y')
+censor_day = 90 # maximum day for plots and estimates
+
+## data edits
+# a) patients
+# slim down variables:
+patients = select(patients, 'pin', 'site_name','country','age', 'sex', 'bmi','ethnicity', 'pregnant',
+                  'date_icu','date_ecmo','date_ecmo_discontinued',
+                  'date_death','date_discharge','last_date',
+                  "height","weight",'date_admission','date_hospital_discharge',
+                  'comorbidity_chronic_kidney_disease','comorbidity_severe_liver_disease',
+                  'comorbidity_diabetes','comorbidity_hypertension',
+                  'sofa','apache_ii',
+                  'ecmo_type','ecmo_drainage_cannula_insertion_site',
+                  'ecmo_return_cannula_insertion_site',
+                  "ecmo_cardiac_arrest_before", "ecmo_worst_pa_o2_6hr_before",
+                  "ecmo_worst_pa_co2_6hr_before", 'ecmo_continuous_rpt_before',
+                  starts_with("complication_"), 'stroke_during_treatment','stroke_type', 'stroke_group','outcome') %>%
+  mutate(pregnant = ifelse(pregnant==0, 'No', 'Yes')) # nicer label
+## inclusion
+patients = filter(patients,
+    !country %in% c('Australia','United Kingdom')) # remove countries that did not collect stroke data
+ 
+## exclusions
+# age, must be adults
+previous_n = nrow(patients)
+n_exclude_age_stroke = nrow(filter(patients, age < 18, !is.na(complication_stroke_date))) # count those excluded in stroke group
+patients = filter(patients,
+    !is.na(age),
+    age >= 18) # 
+n_exclude_age = previous_n - nrow(patients) 
+# no ICU date
+previous_n = nrow(patients)
+n_exclude_icu_stroke = nrow(filter(patients, is.na(date_icu), !is.na(complication_stroke_date))) # count those excluded in stroke
+patients = filter(patients,
+    !is.na(date_icu))
+n_exclude_icu = previous_n -nrow(patients) 
+# missing sex
+previous_n = nrow(patients)
+patients = filter(patients,
+          sex != 'Missing', # remove those with missing sex as they are missing almost all their data
+         !is.na(sex))
+n_exclude_missing = nrow(patients) - previous_n
+  
+# further data edits
+patients  = mutate(patients,
+         # impossible admission date set to missing:
+         date_admission = ifelse(date_admission >= last_possible, NA, date_admission), 
+         date_admission = as.Date(date_admission, origin='1970-01-01'),
+         # update stroke to add EOT
+         complication_stroke = ifelse(!is.na(stroke_during_treatment) & stroke_during_treatment==1, 1, complication_stroke),
+         # labels for factors
+         complication_stroke = factor(complication_stroke, levels=0:1, labels=c('No','Yes')),
+         complication_seizure = factor(complication_seizure, levels=0:1, labels=c('No','Yes')),
+         complication_heart_failure = factor(complication_heart_failure, levels=0:1, labels=c('No','Yes')),
+    comorbidity_chronic_kidney_disease = factor(comorbidity_chronic_kidney_disease, levels=0:1, labels=c('No','Yes')),
+         comorbidity_severe_liver_disease = factor(comorbidity_severe_liver_disease, levels=0:1, labels=c('No','Yes')),
+         comorbidity_diabetes = factor(comorbidity_diabetes, levels=0:1, labels=c('No','Yes')),
+         comorbidity_hypertension = factor(comorbidity_hypertension, levels=0:1, labels=c('No','Yes')),
+         ecmo_cardiac_arrest_before = factor(ecmo_cardiac_arrest_before, levels=0:1, labels=c('No','Yes')),
+         ecmo_continuous_rpt_before = factor(ecmo_continuous_rpt_before, levels=0:1, labels=c('No','Yes')),
+         any_ecmo = as.numeric(ecmo_type!=''),
+         any_ecmo = factor(any_ecmo, levels=0:1, labels=c('No','Yes')))
+
+# b) daily data
+daily = select(daily, pin, date_daily, ecmo, platelet_count, "aptt_aptr", "inr", alt_sgpt, "ast_sgot", 'bilirubin','blood_urea_nitrogen',
+               "lymphocyte_count", 'eotd_anticoagulants', "eotd_anticoagulants_type",
+               "pa_o2", "pa_co2",
+               "eotd_haemorrhagic_complication", "eotd_haemorrhagic_complication_source",
+               ) %>%
+  mutate(date_daily = ifelse(date_daily >= last_possible, NA, date_daily), # impossible date set to missing
+         date_daily = as.Date(date_daily, origin='1970-01-01')) 
+
+# combined
+combined = full_join(patients, daily, by='pin')
+
+# change 'missing' to NA
+for_missing = select(patients, -pin, -any_ecmo, -stroke_type) %>% # remove ID; any_ecmo is never missing; stroke_type is a list variable
+  mutate(
+    ethnicity = ifelse(ethnicity=='Missing', NA, ethnicity),
+    outcome = ifelse(outcome %in% c('','unknown'), NA, outcome)) %>% # tidy up missing outcome
+  mutate_if(~is.character(.x), ~ifelse(.x=='', NA, .x)) # change '' to missing for character variables
+
+# split by ischemic and hemorrhagic separately. Ischemic - ischemic stroke and hypoxic ischemic. Hemorrhagic- sah Iph SDH - all hemarrhages. 
+patients = mutate(patients,
+)
+```
+
+This report uses the data from `r data_date$month` `r data_date$day`. This report uses the scrambled dummy data.
+
+Data from Australia and the UK were not included as these countries did not collect the necessary stroke data.
+
+Patients were excluded for:
+
+* being under age 18 (total excluded = `r n_exclude_age`, stroke patients excluded = `r n_exclude_age_stroke`)
+* not having an ICU admission date (n = `r n_exclude_icu`, stroke patients excluded = `r n_exclude_icu_stroke`)
+
+### Check of stroke numbers
+
+```{r}
+# a) no stroke date
+f = filter(patients, complication_stroke=='Yes') %>%
+  select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge) 
+n_start = nrow(f) # starting number
+n_missing_stroke_date = sum(is.na(f$complication_stroke_date)) # number excluded for missing stroke
+# b) stroke before ICU admission
+f2 = filter(f, 
+            !is.na(complication_stroke_date)) # now use just complete
+n_update = nrow(f2)
+f2 = filter(f2, complication_stroke_date >= date_icu)
+n_stroke_prior_icu = n_update - nrow(f2) # number excluded
+# c) stroke after ICU discharge
+f3 = filter(f2, complication_stroke_date <= date_discharge | !is.na(date_discharge))
+n_stroke_post_icu = nrow(f2) - nrow(f3)
+n_final = nrow(f3)
+```
+
+We start with `r n_start` patients who had a stroke.
+Of these patients `r n_missing_stroke_date` have no stroke date, `r n_stroke_prior_icu` patients had their stroke prior to their ICU admission, and `r n_stroke_post_icu` patients had their stroke after their ICU discharge.
+This gives `r n_final` patients with a known stroke date during their ICU admission.
+
+# Descriptive statistics
+
+The tables below are split by the three types of stroke: Hemorrhage, Ischemic and Other/Unknown. There is also a columns for patients with no stroke.
+
+```{r}
+#
+ftab = desc_table_cont(
+  indata=patients, 
+  vars = c('age','bmi','sofa','apache_ii'), 
+  group_var = 'stroke_group', 
+  var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+  heading = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+  autofit = FALSE,
+  include_total = FALSE) %>%
+  fontsize(size=8) # smaller font to fit
+table_nums(name="cont_table","Continuous variables - table.", level=2) # title
+ftab
+```
+
+```{r}
+ftab = desc_table_cat(indata = patients, 
+                      vars = c('sex','ethnicity','country'), 
+                      group_var = 'stroke_group', 
+                      var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+                      include_total = FALSE,
+                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) # see 99_functions.R
+table_nums(name="cat_table","Categorical variables.", level=2) # title
+ftab
+```
+
+```{r}
+to_tab = filter(patients, sex=='Female')
+ptab = ftab = desc_table_cat(indata = to_tab, 
+                      vars = c('pregnant'), 
+                      group_var = 'stroke_group', 
+                      var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+                      include_total = FALSE,
+                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) 
+table_nums(name="preg_table","Pregnant (women only).", level=2) # title
+ptab
+```
+
+```{r}
+ftab = desc_table_cat(indata = patients, 
+                      vars = 'outcome', 
+                      group_var = 'stroke_group', 
+                      var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+                      include_total = FALSE,
+                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) 
+table_nums(name="outcome_table", "Final outcome", level=2) # title
+ftab
+```
+
+# Model diagram
+
+The figure below shows the four states in the multi-state survival model. Patients start at ICU admission.
+
+```{r}
+states = c('ICU\nadmission','Stroke','Death','ICU\ndischarge')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  3,1,
+  4,1,
+  3,2,
+  4,2
+), byrow = TRUE, ncol=2)
+figure_nums(name="model_diagram", "The four states in the model and the possible movements between states", level=1) # title
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65) # see 99_functions.R
+```
+
+### Table of transitions between states
+
+This table shows the transitions (movements) between the states (`r figure_nums("model_diagram", display = "cite")`).
+
+```{r, include=FALSE}
+### prepare data for survival analysis ###
+## ---- transitions
+my.data = time_transitions(
+  indata = patients, 
+  start_state = 'date_icu',
+  int_state = 'complication_stroke_date', # intermediate state
+  int_state_end = NULL, # no movement out of stroke
+  censor_day = censor_day, 
+  check = TRUE) %>% # from 99_functions.R
+  select(pin, from, to, start, end, date_icu, age, complication_stroke, stroke_type, stroke_group, sex, bmi, site_name, country) %>%
+  rename(id = pin, # rename to suit Martin's use
+         entry = start,
+         exit = end)
+
+# update to state to allow multiple stroke types
+my.data = mutate(my.data,
+                 # 
+                 from = ifelse(from==2 & stroke_group=='Ischemic', 3, from), # 2= other, 3=Ischemic, 4=Hemorrhage
+                 from = ifelse(from==2 & stroke_group=='Hemorrhage', 4, from),
+                 # first make room for extra states
+                 to = ifelse(to==4, 6, to), # move death
+                 to = ifelse(to==3, 5, to), # move discharge
+                 to = ifelse(to==2 & stroke_group=='Ischemic', 3, to), # 2= other, 3=Ischemic, 4=Hemorrhage
+                 to = ifelse(to==2 & stroke_group=='Hemorrhage', 4, to)
+                 )
+
+# check of stroke patients
+index = my.data$id %in% f3$pin # patients with a stroke
+my.data.stroke = my.data[index,]
+#
+not.there = f2$pin[f2$pin%in% my.data$id ==FALSE] # stroke patients not in the transition data
+check = filter(patients, pin%in% not.there) %>%
+    select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge) 
+```
+
+```{r}
+tab = as.data.frame(with(my.data, table(from, to))) %>%
+  mutate(from = case_when(
+    from==1 ~ 'ICU admission', 
+    from==2 ~ 'Stroke: Other/Unknown',
+    from==3 ~ 'Stroke: Ischemic',
+    from==4 ~ 'Stroke: Hemorrhage')
+  ) %>%
+  tidyr::spread(to, Freq)
+# table header
+table_header <- data.frame(
+  col_keys = c('from', '0','2','3','4','5','6'),
+  h1 = c('', rep("State moved to", 6)),
+  h2 = c(' ', '','Stroke','Stroke','Stroke','',''),
+  h3 = c('State moved from', 'Censored','Other/Unknown','Ischemic','Hemorrhage','Discharge','Death'),
+  stringsAsFactors = FALSE )
+
+ftab = flextable(tab) %>%
+ set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+ merge_h(i=1, part = "header") %>% # merge "To" column headers
+ merge_h(i=2, part = "header") %>% # merge stroke
+  theme_box() %>%
+  autofit() %>%
+  align(align='center', part='all') # centre text
+table_nums(name="transitions", "Transition numbers between states") # title
+ftab
+```
+
+
+### Cumulative risk plot for stroke
+
+```{r, fig.width=8, fig.height=6}
+# for nice labels
+my.data = mutate(my.data, from.nice=case_when(
+  from==1 ~ 'ICU', # cannot be any spaces
+  from==2 ~ 'Other/Unknown',
+  from==3 ~ 'Ischemic',
+  from==4 ~ 'Hemorrhage'
+  ))
+# cumulative incidence
+cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from.nice, cencode=0))
+# remove lines not needed (stroke to stroke)
+any_ests = NULL
+for (z in 1:(length(cum_inc)-1)){
+  empty = any(cum_inc[[z]]$est !=0) # find missing
+  any_ests = c(any_ests, empty)
+}
+index = rev(which(any_ests == FALSE))
+for (z in index){
+  cum_inc[[z]] = NULL # blank lines
+}
+# plot
+g = ggcompetingrisks(cum_inc,
+                 xlab = 'Days since ICU admission',
+                 ylab = 'Cumulative probability',
+                 xlim = c(0, censor_day), # 
+                 title = '',
+#                 gsep = '_', # dummy to prevent groups being created from spaces
+                 cumcensor = TRUE, # does not work
+                 legend.title='',
+                 risk.table = TRUE,
+                 conf_int = TRUE)
+# output modified plot
+gmod = g + geom_line(size = 1.05) + # make lines thicker
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
+  # states are = 2,3,4,5,6
+  scale_colour_manual(name="State moved to:", values=c(6,5,2,3,1), labels=c("Other/Unknown","Ischemic",'Hemorrhage',"Discharge",'Death')) +  # change labels
+  theme(
+    panel.grid.major = element_line(colour=grey(0.8)),
+    text = element_text(size=20), 
+    legend.title = element_text(size=16),
+    legend.text = element_text(size=16))
+figure_nums(name="cuminc_death", "Cumulative probabilities over time for the four states.")
+gmod
+jpeg('figures/stroke/competing_risks.jpg', width=6.8, height=6, units='in', res=400, quality=100)
+print(gmod)
+invisible(dev.off())
+```
+
+The two panels of the plot are for the states of "ICU admission" and "stroke". The lines show where patients move to from these states.
+
+There is a clear higher risk of death and lower risk of discharge for patients with a stroke.
+
+## Survival models
+
+Here we model the survival time and outcome (discharge/death) with the aim of examining stroke whilst adjusting for confounders.
+
+```{r, winbugs_model_death_discharge}
+# bugs model
+bfile = 'bugs_survival_stroke_death.txt'
+bugs = file(bfile, 'w')
+cat('model{
+    for (i in 1:N){
+      days[i] ~ dweib(r, mu[i])I(cens[i],) # right-censoring
+      log(mu[i]) <- int + beta[1]*sex[i] + beta[2]*age[i] + beta[3]*bmi[i] + beta[4]*stroke_o[i] + beta[5]*stroke_i[i] + beta[6]*stroke_h[i] + centre[site[i]]
+      bmi[i] ~ dnorm(mu.bmi, tau.bmi) # missing BMI
+    }
+    # priors
+    mu.bmi ~ dnorm(0, 0.1) # vaguely informative (scaled)
+    tau.bmi ~ dgamma(1, 1)
+    int ~ dnorm(0, 0.0001)
+    for(k in 1:6){beta[k] ~ dnorm(0, 0.0001)}
+    for(k in 1:M){ # random effect for site
+      centre[k] ~ dnorm(0, tau.centre)
+    }
+    tau.centre ~ dgamma(1, 1)
+    r ~ dgamma(10, 10)
+}', file=bugs)
+close(bugs)
+```
+
+#### Time to death and discharge
+
+```{r, include=FALSE}
+## prepare the data for 'winbugs' or 'R', need to use clock reset method
+prepare_survival = function(indata, cens_events, clock_reset= TRUE, version='winbugs'){
+  bugs_data = mutate(indata,
+    site_num = as.numeric(as.factor(site_name)), # make site number
+    # clock reset
+    exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
+    # add tiny time because time zero not allowed
+    days = ifelse(to %in% cens_events, NA, exit+0.001), # A right censored observation has a missing observed time ...
+    cens = ifelse(to %in% cens_events, exit+0.001, 0) # ... and a minimum time equal to the censored time
+                   )
+
+if(version=='R'){
+  return(bugs_data)
+}
+if(version=='winbugs'){
+N = nrow(bugs_data)
+M = max(bugs_data$site_num)
+
+# set up survival data for winbugs
+bdata = list(N = N, 
+             M = M,
+             site = bugs_data$site_num,
+             days = bugs_data$days,
+             cens = bugs_data$cens,
+             stroke_o = as.numeric(bugs_data$from==2),
+             stroke_i = as.numeric(bugs_data$from==3),
+             stroke_h = as.numeric(bugs_data$from==4),
+             sex = as.numeric(bugs_data$sex=='Male'),
+             age = (bugs_data$age-50)/10, # scaled
+             bmi = (bugs_data$bmi-30)/5) # scaled
+  return(bdata)
+} # end of if
+} # end of function
+for_death = prepare_survival(indata=my.data, cens_events=c('2','3','4','5','0')) # admission, stroke, discharge or admin censored; event is death ('6')
+for_discharge = prepare_survival(indata=my.data, cens_events=c('2','3','4','6','0')) # admission, stroke, death or admin censored; event is discharge ('5')
+```
+
+```{r, include=FALSE}
+## run the survival models in WinBUGS
+# could remove individual effect, it is not helping much
+n.chains= 2
+MCMC = 2000 # increase to 10,000 for final run
+thin = 2 # increase to 5
+debug = TRUE
+
+# initial values for single variable outcome (use mean for intercept)
+inits_start = list(r=1, beta=rep(0,6), int=0, tau.centre=1, centre=rep(0, for_death$M), mu.bmi=0, tau.bmi=1) 
+parameters = c('r','beta','int','centre','tau.centre') # 
+  
+##
+# a) death
+# do not run model if there are already estimates (save time)
+any_model = length(dir(path='results', pattern='bugs_death_stroke')) > 0
+# run model
+if(any_model == FALSE){
+  # add initial values for days that are beyond censored time
+  initial_days = for_death$cens+1
+  initial_days[for_death$cens ==0] = NA
+  inits = inits_start
+  inits$days = initial_days
+  inits = rep(list(inits), n.chains) # repeat initial values per chain
+  # run model
+  bugs_results_death = bugs(data=for_death, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
+  save(bugs_results_death, file='results/survival_bugs_death_stroke.RData')
+}
+if(any_model == TRUE){
+  load('results/survival_bugs_death_stroke.RData')
+}
+# b) discharge
+any_model = length(dir(path='results', pattern='bugs_discharge_stroke')) > 0
+# run model
+if(any_model == FALSE){
+  # add initial values for days that are beyond censored time
+  initial_days = for_discharge$cens+1
+  initial_days[for_discharge$cens ==0] = NA
+  inits = inits_start
+  inits$days = initial_days
+  inits = rep(list(inits), n.chains) # repeat initial values per chain
+  # run model
+  bugs_results_discharge = bugs(data=for_discharge, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
+  save(bugs_results_discharge, file='results/survival_bugs_discharge_stroke.RData')
+}
+if(any_model == TRUE){
+  load('results/survival_bugs_discharge_stroke.RData')
+}
+# 
+```
+
+The table below is the hazard ratios (HRs) and 95% credible intervals for the competing risks of death and discharge. 
+A hazard ratio of 1 indicates no change in risk, whereas a hazard ratio above 1 indicates increased risk, and a hazard ratio below 1 indicated decreased risk.
+
+```{r}
+## tabulate the results
+# get beta estimates
+beta_death = bugs_extract(inbugs=bugs_results_death, var='beta', exp=TRUE, names=c('Male','Age (+10 years)','BMI (+5 kg/m2)','Stroke - Other/unknown','Stroke - Ischemic','Stroke - Hemorrhage'), digits=2, make.ci=TRUE) # from 99_functions.R
+beta_discharge = bugs_extract(inbugs=bugs_results_discharge, var='beta', exp=TRUE, names=NULL, digits=2, make.ci=TRUE) # from 99_functions.R
+for_table = bind_cols(beta_death, beta_discharge) %>%
+  select(-row, -Var) 
+names(for_table) = c('var','mean1','ci1','mean2','ci2')
+#
+header = read.table(header=TRUE, stringsAsFactors = FALSE, sep="!", text='
+col_keys!colB!colA
+var! !Variable
+mean1!Death!HR
+ci1!Death!95% CI
+mean2!Discharge!HR
+ci2!Discharge!95% CI
+')
+#
+ftab = flextable(for_table) %>%
+  set_header_df(mapping = header, key = "col_keys" ) %>%
+  merge_h(part = "header", i = 1) %>%
+  theme_box() %>% # nice theme 
+  align(align='center', part='all') %>% # centre text
+  autofit()
+table_nums(name="hr_weibull", "Hazard ratios and 95% credible intervals for death and discharge from the Weibull model")
+ftab
+## numbers used in text:
+# bayesian p-value for stroke
+pval_prone = sum(bugs_results_death$sims.list$beta[,1]<0) / (length(bugs_results_death$sims.list$beta[,1]) + 1)
+# get number administratively censored
+censored = group_by(my.data, id) %>%
+  arrange(id, entry) %>%
+  slice(n()) %>% # last per patient
+  filter(to == '0') # admin censored
+```
+
+<!--- Older age increases the hazard of death and decreases the hazard of discharge. --->
+
+## Cumulative survival models
+
+The survival models in this section focus on the patients' final (or cumulative) outcome of death and discharge, whereas the previous models examined the instantaneous hazard of experiencing death or discharge. 
+
+The table below shows the cumulative hazard ratios and 95% confidence intervals for death and discharge.
+
+```{r}
+my.data_crr = mutate(my.data, 
+  # clock reset
+  exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
+  # prepare variables
+   stroke_other = as.numeric(from==2), # # 2= other, 3=Ischemic, 4=Hemorrhage
+   stroke_ischemic = as.numeric(from==3),
+   stroke_hemorrhage = as.numeric(from==4),
+   age = (age-50)/10, # scaled
+   bmi = (bmi-30)/5, # scaled
+   sex = as.numeric(sex=='Male'))
+# small amounts of missing
+my.data_crr = mutate(my.data_crr,
+          bmi = ifelse(is.na(bmi)==TRUE, 0, bmi)) # use mean
+#
+cov1 = as.matrix(select(my.data_crr, sex, age, bmi, stroke_other, stroke_ischemic, stroke_hemorrhage))
+# death model (to = 6)
+cum_rr_death = with(my.data_crr, crr(ftime=exit, fstatus=to==6, cov1=cov1, cencode='0', maxiter = 100))
+# discharge model (to =5)
+cum_rr_discharge = with(my.data_crr, crr(ftime=exit, fstatus=to==5, cov1=cov1, cencode='0', maxiter = 100))
+s_death = summary(cum_rr_death) # cannot use broom
+s_discharge = summary(cum_rr_discharge) # cannot use broom
+table_death = as.data.frame(s_death$coef); names(table_death) = c('coef','exp_coef','SE','z','pval')
+table_discharge = as.data.frame(s_discharge$coef); names(table_discharge) = c('coef','exp_coef','SE','z','pval')
+tab = bind_rows(table_death, table_discharge, .id='type') # combine tables
+table = mutate(tab,
+         z = qnorm(0.975),
+         lower = coef - (z*SE), # make CIs
+         upper = coef + (z*SE),
+         HR = roundz(exp(coef), 2),
+         lower = roundz(exp(lower), 2),
+         upper = roundz(exp(upper), 2),
+         CI = paste(lower, ' to ', upper, sep='')) %>%
+  select(type, HR, CI) 
+ftable = bind_cols(filter(table, type==1) %>% select(-type),
+                  filter(table, type==2) %>% select(-type))
+names(ftable) = c('HR1','CI1','HR2','CI2')
+#
+table_header <- data.frame(
+  col_keys = c('Variable', 'HR1','CI1','HR2','CI2'),
+  h2 = c('', 'Death','Death','Discharge','Discharge'),
+  h3 = c('Variable', 'HR','95% CI', 'HR','95% CI'),
+  stringsAsFactors = FALSE )
+# nice table
+ftable = mutate(ftable, Variable=c('Male','Age (+10 years)','BMI (+5 kg/m2)',"Stroke - other","Stroke - Ischemic","Stroke - Hemorrhage")) %>%
+  select('Variable', everything()) %>% # move Variable first
+  flextable() %>%
+  set_header_df(mapping = table_header, key = "col_keys") %>% # add header
+  merge_h(i=1, part = "header") %>% # merge  column headers
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit() 
+table_nums(name="crr_hazards", "Hazard ratios and 95% confidence intervals using a cumulative probability regression model")
+ftable
+```
+
+<!--- Older age increases the cumulative risk of death and decreases the cumulative risk of discharge. --->
+
+# Appendices
+
+These appendices contain additional results and checks of the models. These could be appendices to the paper.
+
+##### Site effects (death and discharge)
+
+```{r, fig.width=5, fig.height=6}
+# get centre estimates
+centres_death = bugs_extract(inbugs=bugs_results_death, var='^centre', exp=TRUE) %>% # from 99_functions.R
+  mutate(type = 1)
+# annotation
+centres_discharge = bugs_extract(inbugs=bugs_results_discharge, var='^centre', exp=TRUE) %>% # from 99_functions.R
+  mutate(type = 2)
+# annotation
+labels = data.frame(row=0, mean=1, lower=0, upper=0, facet=1, label=c('Increased hazard','Decreased hazard'))
+# combine estimates
+centres = bind_rows(centres_death, centres_discharge) %>%
+  group_by(row) %>%
+  mutate(mean_hr = mean(mean)) %>% # calculate average HR
+  ungroup() %>%
+  mutate(order = as.numeric(as.factor(mean_hr)),
+         order = ifelse(type==2, order+0.2, order), # jitter
+         facet = ifelse(order >= 60, 2, 1),
+         order = ifelse(facet==2, order-60, order))
+# plot
+cplot = ggplot(data=centres, aes(x=order, y=mean, ymin=lower, ymax=upper, col=factor(type)))+
+  geom_hline(lty=2, yintercept=1)+
+  geom_point()+
+  scale_y_log10()+
+  scale_x_continuous(breaks=NULL, labels = NULL, limits=c(0, 61+0.2), expand=c(0.01,0.01))+
+  scale_color_manual(NULL, values=c('indianred','skyblue'), labels=c('Death','Discharge'))+
+  geom_errorbar(width=0)+
+  geom_text(data=labels, size=3, aes(x=row, y=mean, label=label), col='black', hjust=c(-0.1, 1.1))+
+  xlab('')+
+  ylab('Hazard ratio')+
+  coord_flip()+
+  theme_bw()+
+  theme(legend.position='top',
+        panel.grid.minor.y = element_blank(), 
+        panel.grid.major.y = element_blank(),
+        strip.background = element_blank(), # remove facet labels
+        strip.text.x = element_blank())+
+  facet_wrap(~facet)
+figure_nums(name="site_death", "Site effects from the Weibull survival model for death and discharge")
+cplot
+```
+
+The hazard ratio axis is on log scale (base 10). Each row is a site and there are two estimates per site: one for death and one for discharge. The sites are ordered from lowest to highest risk. The plot has been split into two panels because of the number of sites.
+
+### Alternative Cox survival models
+
+Here we use non-parametric Cox models to confirm the results from the parametric Weibull survival models. These models use the multi-state approach, so patients could move from prone to supine (or vice versa) over time.
+These Cox models do not account for correlated results from the same patient, but they do account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
+
+The table shows the mean hazard ratios (HRs) and 95% confidence intervals for death and discharge.
+
+```{r}
+# use function to run Cox models (also used below in leave-one-out analysis)
+run_cox_models = function(in_discharge, in_death, digits=2){
+  # convert lists to data frames
+  if(class(in_discharge) == 'list'){in_discharge = as.data.frame(in_discharge)}
+  if(class(in_death) == 'list'){in_death = as.data.frame(in_death)}
+  # a) discharge
+  in_discharge = mutate(in_discharge,
+          bmi = ifelse(is.na(bmi)==TRUE, 0, bmi)) # simple imputation of mean
+  # cox
+  in_discharge = mutate(in_discharge,
+    days = ifelse(is.na(days)==TRUE, cens, days)) # get days from censored or uncensored
+  c_disch = coxph(Surv(days, event=cens==0, type='right') ~ sex + age + bmi + stroke + cluster(site), data=in_discharge)
+  ests_disch = tidy(c_disch, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep='')) %>%
+    select(-term, -std.error, -statistic, -p.value) %>%
+    rename('HR2' = 'estimate',
+           'CI2' = 'CI',
+           'conf.low2' = 'conf.low',
+           'conf.high2' = 'conf.high')
+  # b) death
+  in_death = mutate(in_death,
+          bmi = ifelse(is.na(bmi)==TRUE, 0, bmi)) # simple imputation of mean
+  # cox
+  in_death = mutate(in_death,
+            days = ifelse(is.na(days)==TRUE, cens, days)) # get days from censored or uncensored
+  c_death = coxph(Surv(days, event=cens == 0, type='right') ~ sex + age + bmi + stroke + cluster(site), data=in_death)
+  ests_death = tidy(c_death, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep = '')) %>%
+    select(-std.error, -statistic, -p.value) %>%
+    rename('HR1' = 'estimate',
+           'CI1' = 'CI',
+           'conf.low1' = 'conf.low',
+           'conf.high1' = 'conf.high')
+  for_tab = bind_cols(ests_death, ests_disch) %>%
+    mutate(term = str_remove(string=term, pattern='in_death\\$'))
+ # return
+ to.return = list()
+ to.return$table = for_tab
+ to.return$discharge_model = c_disch
+ to.return$death_model = c_death
+ to.return$death_data = in_death # add data
+ to.return$discharge_data = in_discharge # 
+ return(to.return) 
+}
+cox_models = run_cox_models(in_discharge = for_discharge, in_death = for_death) # run above function
+for_tab = cox_models$table %>% 
+  select(term, HR1, CI1, HR2, CI2) 
+## nice table
+  header = read.table(header=TRUE, stringsAsFactors = FALSE, sep="!", text='
+col_keys!colB!colA
+term! !Variable
+HR1!Death!HR
+CI1!Death!95% CI
+HR2!Discharge!HR
+CI2!Discharge!95% CI
+')
+ftab = flextable(for_tab) %>%
+  set_header_df(mapping = header, key = "col_keys") %>%
+  merge_h(part = "header", i = 1) %>%
+  theme_box() %>%# nice theme
+  align(align='center', part='all') %>%# centre text
+  autofit()
+table_nums(name="hr_cox", "Hazard ratios and 95% credible intervals for death and discharge from the Cox model")
+ftab 
+```
+
+

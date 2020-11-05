@@ -1,0 +1,965 @@
+---
+title: "CCCC: ECMO and ICH patients"
+author: "Adrian Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document: 
+      reference_docx: rmarkdown-styles-SAP.docx
+---
+  
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, comment='', dpi=400)
+options(width=1000) # Wide pages
+options(scipen=999) # avoid scientific presentation
+z = qnorm(0.975)
+source('99_functions.R')
+library(pander)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(flextable) # for nice tables
+#library(broom)
+library(summarytools)
+# global options for summary tools
+ st_options(plain.ascii = FALSE,       # This is very handy in all Rmd documents
+            style = "rmarkdown",        # This too
+            round.digits = 0, 
+            headings = FALSE, 
+            display.labels = FALSE,
+            footnote = NA,             # Avoids footnotes which would clutter the results
+            subtitle.emphasis = FALSE  # 
+ ) 
+
+# graphics things:
+library(visdat) # for missing data
+library(ggplot2)
+library(ggupset)  # to plot combination of symptoms
+g.theme = theme_bw() + theme(panel.grid.minor = element_blank())
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#999999", "#CC79A7")
+
+## get the data
+load(file='data/COVID_Data_stroke.RData') # from 0_read_data.R
+# make last possible date based on database freeze
+last_possible = as.Date(paste(data_date$day, data_date$month, '2020', sep='-'), format='%d-%b-%Y')
+
+## data edits
+# a) patients
+patients = select(patients, 'pin', 'country','age', 'sex', 'ethnicity',
+                  "height","weight",'date_admission','date_hospital_discharge',
+                  'comorbidity_chronic_kidney_disease','comorbidity_severe_liver_disease',
+                  'comorbidity_diabetes','comorbidity_hypertension',
+                  'sofa','date_icu','date_ecmo','date_ecmo_discontinued',
+                  'ecmo_type','ecmo_drainage_cannula_insertion_site',
+                  'ecmo_return_cannula_insertion_site',
+                  "ecmo_cardiac_arrest_before", "ecmo_worst_pa_o2_6hr_before",
+                  "ecmo_worst_pa_co2_6hr_before", 'ecmo_continuous_rpt_before',
+                  starts_with("complication_"), 'stroke_during_treatment','stroke_type', 'outcome') %>% # slim down variables
+  # impossible admission date set to missing:
+  mutate(date_admission = ifelse(date_admission >= last_possible, NA, date_admission), 
+         date_admission = as.Date(date_admission, origin='1970-01-01'),
+         # update stroke to add EOT
+         complication_stroke = ifelse(!is.na(stroke_during_treatment) & stroke_during_treatment==1, 1, complication_stroke),
+         # labels for factors
+         complication_stroke = factor(complication_stroke, levels=0:1, labels=c('No','Yes')),
+         complication_seizure = factor(complication_seizure, levels=0:1, labels=c('No','Yes')),
+         complication_heart_failure = factor(complication_heart_failure, levels=0:1, labels=c('No','Yes')),
+    comorbidity_chronic_kidney_disease = factor(comorbidity_chronic_kidney_disease, levels=0:1, labels=c('No','Yes')),
+         comorbidity_severe_liver_disease = factor(comorbidity_severe_liver_disease, levels=0:1, labels=c('No','Yes')),
+         comorbidity_diabetes = factor(comorbidity_diabetes, levels=0:1, labels=c('No','Yes')),
+         comorbidity_hypertension = factor(comorbidity_hypertension, levels=0:1, labels=c('No','Yes')),
+         ecmo_cardiac_arrest_before = factor(ecmo_cardiac_arrest_before, levels=0:1, labels=c('No','Yes')),
+         ecmo_continuous_rpt_before = factor(ecmo_continuous_rpt_before, levels=0:1, labels=c('No','Yes')),
+         any_ecmo = as.numeric(ecmo_type!=''),
+         any_ecmo = factor(any_ecmo, levels=0:1, labels=c('No','Yes')))
+
+# b) daily
+daily = select(daily, pin, date_daily, ecmo, platelet_count, "aptt_aptr", "inr", alt_sgpt, "ast_sgot", 'bilirubin','blood_urea_nitrogen',
+               "lymphocyte_count", 'eotd_anticoagulants', "eotd_anticoagulants_type",
+               "pa_o2", "pa_co2",
+               "eotd_haemorrhagic_complication", "eotd_haemorrhagic_complication_source",
+               ) %>%
+  mutate(date_daily = ifelse(date_daily >= last_possible, NA, date_daily), # impossible date set to missing
+         date_daily = as.Date(date_daily, origin='1970-01-01')) 
+
+## inclusion/exclusion ## 
+patients = filter(patients,
+    !country %in% c('Australia','United Kingdom')) # remove countries that did not collect stroke data
+## exclusions
+# age, must be adults
+patients = filter(patients,
+    !is.na(age),
+    age >= 18) # 
+# no ICU date
+patients = filter(patients,
+    !is.na(date_icu))
+# missing sex (done below)
+
+# combined
+combined = full_join(patients, daily, by='pin')
+
+# change 'missing' to NA
+for_missing = select(patients, -pin, -any_ecmo, -stroke_type) %>% # remove ID; any_ecmo is never missing; stroke_type is a list variable
+  mutate(
+    sex = ifelse(sex=='Missing', NA,  sex),
+    ethnicity = ifelse(ethnicity=='Missing', NA, ethnicity),
+    outcome = ifelse(outcome %in% c('','unknown'), NA, outcome)) %>% # tidy up missing outcome
+  mutate_if(~is.character(.x), ~ifelse(.x=='', NA, .x)) # change '' to missing for character variables
+
+# reference dates for chloe
+for_chloe = filter(patients, complication_stroke=="Yes") %>%
+  select(pin, date_admission)
+write.csv(for_chloe, file='data/for_chloe.csv', quote=FALSE, row.names = FALSE)
+
+## exclusions
+# ... none yet
+```
+
+This report uses the data from `r data_date$month` `r data_date$day`.
+
+# How complete is the data?
+
+#### a) Missing data from patient records
+
+Here we look at patients missing stroke data to see how complete their other records are.
+
+```{r, fig.width=8}
+# remove conditional variables and lists
+vis_dat(for_missing)
+missing_gender = sum(is.na(for_missing$sex))
+```
+
+The grey areas are the missing data. 
+
+#### b) Missing data from daily records
+
+```{r, include=FALSE}
+# exclude missing sex
+to_exclude = filter(patients, sex=='Missing')$pin
+combined = filter(combined, !pin %in% to_exclude)
+patients = filter(patients, !pin %in% to_exclude)
+daily = filter(daily, !pin %in% to_exclude)
+for_missing = filter(for_missing, !is.na(sex))
+```
+
+```{r, fig.width=7}
+# remove conditional variables and lists
+for.missing = select(daily, -pin) %>%
+  mutate_if(~is.character(.x), ~ifelse(.x=='', NA, .x)) # change '' to missing for character variables
+vis_dat(for.missing)
+```
+
+The grey areas are the missing data.
+
+#### Missing data and stroke
+
+Do patients with a stroke have mortality data available? The table below shows whether the final outcome is known or unknown, and whether the stroke data is complete or missing. There is a lot of partially complete data. This uses the simple definition of stroke from the complications list. 
+
+```{r, results='asis'}
+to_table = mutate(patients, 
+          outcome = ifelse(outcome=='', 'Outcome=Unknown', 'Outcome=Known'),
+          stroke = ifelse(is.na(complication_stroke), 'Stroke=Missing', 'Stroke=Complete'))
+tab_complete = with(to_table, ctable(outcome, stroke, chisq=FALSE, round.digits=0, dnn=c(' ',''), prop='t', totals=FALSE))
+tab_complete
+```
+
+
+# Descriptive statistics
+
+### Countries 
+
+The table rows are ordered by frequency.
+
+```{r, results='asis'}
+tab = with(patients, freq(country, round.digits=0, report.nas = FALSE, order='freq'))
+tab
+```
+
+### Numbers on ECMO
+
+```{r, results='asis'}
+tab_any = with(patients, freq(any_ecmo, round.digits=1, cumul = FALSE, report.nas	=FALSE))
+tab_any
+# percent and 95% CI
+r = sum(patients$any_ecmo=='Yes')
+n = nrow(patients)
+p = r/n
+se = sqrt(p*(1-p)/n)
+lower = p - (z*se)
+upper = p + (z*se)
+```
+
+The percent of patients experiencing any ECMO is `r roundz(p*100,1)`% with a 95% confidence interval from `r roundz(lower*100,1)`% to `r roundz(upper*100,1)`%.
+
+### ECMO type
+
+Just for those with any ECMO.
+
+```{r, results='asis'}
+to_table = filter(patients, ecmo_type!='')
+tab_ecmo_type = with(to_table, freq(ecmo_type, round.digits=0, report.nas	=FALSE, cumul = FALSE))
+tab_ecmo_type
+```
+
+### Cross-tabulation of sex by any ECMO
+
+```{r, results='asis'}
+tab_sex = with(patients, ctable(sex, any_ecmo, chisq=FALSE, round.digits=0, dnn=c(' ',''), prop='c'))
+tab_sex
+```
+
+### Age summary statistics by any ECMO
+
+```{r}
+tab_age = group_by(patients, any_ecmo) %>%
+  summarise(n=n(), 
+            mean=round(mean(age, na.rm=TRUE)),
+            sd=round(sd(age, na.rm=TRUE),1)
+            )
+f = flextable(tab_age)
+autofit(f)
+```
+
+
+### Cross-tabulation of ethnicity by any ECMO
+
+```{r, results='asis'}
+tab_eth = with(patients, ctable(ethnicity, any_ecmo, round.digits=0, dnn=c(' ',''), prop='c'))
+tab_eth
+```
+
+### Height and weight
+
+##### Box & violin plots of height and weight
+
+```{r, fig.width=8}
+to_plot = select(patients, pin, any_ecmo, height, weight) %>%
+  gather(key='var', value='res', -pin, -any_ecmo) %>%
+  filter(!is.na(res))
+vplot = ggplot(data=to_plot, aes(x=any_ecmo, y=res, fill=any_ecmo)) +
+  geom_boxplot()+
+  geom_violin(alpha=0.5)+
+  facet_wrap(~var)+
+  g.theme+
+  xlab('')+
+  ylab('Height or weight')+
+#scale_y_continuous(breaks=NULL)+
+  coord_flip()+
+  scale_fill_manual('Any ECMO', values=cbPalette)
+vplot
+```
+
+The black dots are potential outliers. The box contains the central 50% of the data.
+
+Height is in cm and weight in kg.
+
+##### Summary statistics for height and weight
+
+```{r}
+cont_vars = c('height','weight')
+#
+tab = select(patients, pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep=''),
+            Min = roundz(min(Value, na.rm=TRUE),0),
+            Max = roundz(max(Value, na.rm=TRUE),0)) %>%
+  select(Variable, Missing, Median, IQR, Min, Max) %>%
+  mutate(Variable = ifelse(Variable=='age', 'Age', Variable))
+ftab = flextable(tab) %>% 
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+### Cross-tabulation of chronic kidney disease by any ECMO
+
+```{r, results='asis'}
+tab_kidney = with(patients, ctable(comorbidity_chronic_kidney_disease, any_ecmo, chisq=FALSE, round.digits=0, dnn=c(' ',''), prop='c'))
+tab_kidney
+```
+
+ECMO (No/Yes) is the columns.
+
+### Cross-tabulation of severe liver disease by any ECMO
+
+```{r, results='asis'}
+tab_liver= with(patients, ctable(comorbidity_severe_liver_disease, any_ecmo, chisq=FALSE, round.digits=0, dnn=c(' ',''), prop='c'))
+tab_liver
+```
+
+ECMO (No/Yes) is the columns.
+
+### Cross-tabulation of diabetes by any ECMO
+
+```{r, results='asis'}
+tab_diab = with(patients, ctable(comorbidity_diabetes, any_ecmo, chisq=FALSE, prop='c', round.digits=0, dnn=c(' ','.')))
+tab_diab
+```
+
+ECMO (No/Yes) is the columns.
+
+### Cross-tabulation of hypertension by any ECMO
+
+```{r, results='asis'}
+tab_hyper = with(patients, ctable(comorbidity_hypertension, any_ecmo, chisq=FALSE, prop='c', round.digits=0, dnn=c(' ','.')))
+tab_hyper
+```
+ECMO (No/Yes) is the columns.
+
+
+### SOFA
+
+##### Box & violin plots of SOFA
+
+```{r}
+vplot = ggplot(data=patients, aes(x=any_ecmo, y=sofa, fill=any_ecmo)) +
+  geom_boxplot()+
+  geom_violin(alpha=0.5)+
+  g.theme+
+  xlab(' ')+
+  ylab('SOFA score')+
+  scale_fill_manual('Any ECMO', values=cbPalette)
+vplot
+```
+
+##### Summary statistics for SOFA
+
+```{r}
+cont_vars = c('sofa')
+#
+tab = select(patients, pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep=''),
+            Min = roundz(min(Value, na.rm=TRUE),0),
+            Max = roundz(max(Value, na.rm=TRUE),0)) %>%
+  select(Variable, Missing, Median, IQR, Min, Max) %>%
+  mutate(Variable = ifelse(Variable=='age', 'Age', Variable))
+ftab = flextable(tab) %>% 
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+## Combined table of percentages
+
+The table is a combined table of the information above for the categorical variables shown as counts and percentages (in round brackets). 
+
+```{r, results='asis'}
+t1 = make_nice(tab_sex, rows = 'Female')
+t2 = make_nice(tab_eth, rows = c('aboriginal','arab','black','east_asian','latin_american','south_asian','west_asian','white','other'))
+t2[,1] = paste(t2[,1], '  ') # trying to play with alignment for gender
+t3 = make_nice(tab_kidney, rows='Yes');  t3[1] = 'Kidney disease' # rename row
+t4 = make_nice(tab_liver, rows='Yes');  t4[1] = 'Liver disease' 
+t5 = make_nice(tab_diab, rows='Yes');  t5[1] = 'Diabetes' 
+t6 = make_nice(tab_hyper, rows='Yes');  t6[1] = 'Hypertension' 
+mega_table = data.frame(rbind(t1, t2, t3, t4, t5, t6))
+row.names(mega_table) = NULL
+names(mega_table) = c('Variable','Total','No ECMO','ECMO')
+pander(mega_table, style='simple', justify='right')
+```
+
+# Summary statistics for patients on ECMO
+
+```{r, include=FALSE}
+ecmo_patients = filter(patients, any_ecmo=='Yes') %>%
+  mutate(
+    days_ecmo = as.numeric(date_ecmo_discontinued - date_ecmo + 0.5),
+    days_hosp = as.numeric(date_hospital_discharge - date_admission + 0.5),
+    day = as.numeric(date_ecmo - date_icu))
+```
+
+
+## Demographics
+
+### Age
+
+```{r}
+cont_vars = c('age')
+#
+tab = select(ecmo_patients, pin, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep=''),
+            Min = roundz(min(Value, na.rm=TRUE),0),
+            Max = roundz(max(Value, na.rm=TRUE),0)) %>%
+  select(Variable, Missing, Median, IQR, Min, Max) %>%
+  mutate(Variable = ifelse(Variable=='age', 'Age', Variable))
+ftab = flextable(tab) %>% 
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+Age is only available in 5 year intervals.
+
+### Categorical variables
+
+```{r}
+#
+cat_vars = c('sex','ethnicity','country')
+#
+tab = select(ecmo_patients, pin, all_of(cat_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(Percent = roundz(prop.table(Count)*100,0)) %>% # calculate percent
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() 
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable")) %>% # merge rows
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+The table rows are ordered by frequency.
+
+### Summaries for time variables in days
+
+```{r}
+time_vars = c('days_ecmo','days_hosp','day')
+#
+tab = select(ecmo_patients, pin, all_of(time_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable) %>%
+  mutate(Value = ifelse(Value < 0, NA, Value)) %>% # blank obvious errors
+  summarise(Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep=''),
+            Min = roundz(min(Value, na.rm=TRUE),0),
+            Max = roundz(max(Value, na.rm=TRUE),0)) %>%
+  select(Variable, Missing, Median, IQR, Min, Max) %>%
+  mutate(Variable = case_when(
+    Variable == 'days_ecmo' ~ 'Length of the ECMO run',
+    Variable == 'days_hosp' ~ 'Hospital length of stay',
+    Variable == 'day' ~ 'Day put on ECMO'
+  ))
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+
+Just for the `r nrow(ecmo_patients)` on ECMO. IQR is the inter-quartile range.
+
+## Other ECMO summaries 
+
+```{r}
+#
+cat_vars = c('ecmo_drainage_cannula_insertion_site', 'ecmo_return_cannula_insertion_site', 'ecmo_cardiac_arrest_before', 'ecmo_continuous_rpt_before')
+#
+tab = select(ecmo_patients, pin, all_of(cat_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin) %>%
+  group_by(Variable, Value) %>%
+  summarise(Count = n()) %>%
+  group_by(Variable) %>%
+  mutate(Percent = roundz(prop.table(Count)*100,0)) %>% # calculate percent
+  arrange(Variable, -Count) %>% # arrange from high to low within variables
+  ungroup() %>%
+  mutate(
+    # sort out missing
+    Value = ifelse(is.na(Value)==TRUE, 'Missing', Value),
+    Value = ifelse(Value=='', 'Missing', Value),
+    # nicer labels
+    Variable = ifelse(Variable=='ecmo_drainage_cannula_insertion_site', 'Drainage cannula insertion site', Variable),
+         Variable = ifelse(Variable=='ecmo_return_cannula_insertion_site', 'Return cannula insertion site', Variable),
+         Variable = ifelse(Variable=='ecmo_cardiac_arrest_before', 'Cardiac arrest before ECMO', Variable),
+         Variable = ifelse(Variable=='ecmo_continuous_rpt_before', 'Continuous Renal Replacement Therapy before ECMO', Variable))
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable")) %>% # merge rows
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+
+Just for the `r nrow(ecmo_patients)` on ECMO. "(Empty string)" means the data are missing. 
+
+### Blood gases before and after ECMO
+
+#### a) PaO2
+
+```{r, results='asis'}
+pa_o2_data = blood_gases(before_var='ecmo_worst_pa_o2_6hr_before',
+                       after_var = 'pa_o2') # from 99_functions.R
+lplot = ggplot(data=pa_o2_data$to_plot, aes(x=xaxis, y=result, group=pin))+
+  geom_line(col=grey(0.4))+
+  geom_line(data=pa_o2_data$av_line, aes(x=xaxis, y=result, group=pin), col='dark red')+ # add average
+  theme_bw()+
+  scale_x_discrete(expand = c(0.05,0.05)) + # reduce white space
+  xlab('')+
+  ylab('PaO2 (log scale)')+
+  scale_y_log10()
+lplot
+```
+
+Here we examine the trends in PaO2 from 6 hours before ECMO initiation to the first PaO2 in the period after ECMO initiation.
+
+The line plot shows the individual change in PaO2 for `r length(unique(pa_o2_data$to_plot$pin))` patients with available blood gas data and ECMO dates. The y-axis is on a log-scale because of the positive skew in PaO2. The red lines shows the average difference between the two times.
+
+The mean percentage change between the worst before reading and first reading after ECMO was `r roundz(pa_o2_data$test$pdiff, 1)` with a 95% confidence interval from `r roundz(pa_o2_data$test$conf.int[1], 1)` to `r roundz(pa_o2_data$test$conf.int[2], 1)` and p-value `r format.pval(pa_o2_data$test$p.value, eps=0.001, digits=3)` (using a paired t-test with log-transformed data).
+
+#### b) PaCO2
+
+```{r, results='asis'}
+pa_co2_data = blood_gases(before_var='ecmo_worst_pa_co2_6hr_before',
+                       after_var = 'pa_co2') # from 99_functions.R
+lplot = ggplot(pa_co2_data$to_plot, aes(x=xaxis, y=result, group=pin))+
+  geom_line(col=grey(0.4))+
+  geom_line(data=pa_co2_data$av_line, aes(x=xaxis, y=result, group=pin), col='dark red')+ # add average
+  scale_x_discrete(expand = c(0.05,0.05)) + # reduce white space
+  theme_bw()+
+  xlab('')+
+  ylab('PaCO2 (log-scale)')+
+  scale_y_log10()
+lplot
+```
+
+Here we examine the trends in PaO2 from 6 hours before ECMO initiation to the first PaCO2 in the period after ECMO initiation.
+
+The line plot shows the individual change in PaCO2 for `r length(unique(pa_o2_data$to_plot$pin))` patients with available blood gas data and ECMO dates. The y-axis is on a log-scale because of the positive skew in PaCO2.
+
+The mean percentage change between the worst before reading and first reading after ECMO was `r roundz(pa_co2_data$test$pdiff, 1)` with a 95% confidence interval from `r roundz(pa_co2_data$test$conf.int[1], 1)` to `r roundz(pa_co2_data$test$conf.int[2], 1)` and p-value `r format.pval(pa_co2_data$test$p.value, eps=0.001, digits=3)` (using a paired t-test with log-transformed data).
+
+
+
+# Values collected during the ICU stay
+
+```{r, include=FALSE}
+# data to plot, must have dates
+to_plot = filter(combined, 
+                 !is.na(date_icu),
+                 !is.na(date_daily)) %>%
+  mutate(day = as.numeric(date_daily - date_icu)) %>%
+  filter(day <= 21) # exclude long stays for the plot
+```
+
+I limit the plots below to the first 21 days during the ICU stay.
+
+## Platelet count
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=platelet_count, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('Platelet count')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(platelet_count, na.rm = TRUE),
+            se = sem(platelet_count)) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('Platelet count')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+## Blood urea nitrogen
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=blood_urea_nitrogen, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('Blood urea nitrogen')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(blood_urea_nitrogen, na.rm = TRUE),
+            se = sem(blood_urea_nitrogen)) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('Blood urea nitrogen')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+## Bilirubin
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=bilirubin, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('Bilirubin')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(bilirubin, na.rm = TRUE),
+            se = sem(bilirubin)) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('Bilirubin')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+## APTT/APTR
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=aptt_aptr, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('APTT/APTR')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(aptt_aptr, na.rm = TRUE),
+            se = sem(aptt_aptr)) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('APTT/APTR')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+## INR
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=inr, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('INR')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(inr, na.rm = TRUE),
+            se = sem(inr)) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('INR')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+## ALT-SGPT
+
+For this variable I use a log-transform because the variable has a very strong positive skew.
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=alt_sgpt, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('ALT-SGPT (log-scale)')+
+  scale_y_log10()+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+The y-axis is on a log scale.
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(log(alt_sgpt), na.rm = TRUE),
+            se = sem(log(alt_sgpt))) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('Log-transformed ALT-SGPT')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+The y-axis is for the log-transformed value.
+
+## AST-SGOT
+
+For this variable I use a log-transform because the variable has a very strong positive skew.
+
+##### Boxplot over time
+
+```{r, fig.width=8}
+tplot = ggplot(data=to_plot, aes(x=factor(day), y=ast_sgot, col=factor(any_ecmo)))+
+  geom_boxplot()+
+  xlab('Day in ICU')+
+  ylab('AST-SGOT (log-scale)')+
+  scale_y_log10()+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+The y-axis is on a log scale.
+
+##### Plot of means and 95% confidence intervals for the means over time
+
+```{r, fig.width=8}
+to_stat = group_by(to_plot, day, any_ecmo) %>%
+  summarise(mean = mean(log(ast_sgot), na.rm = TRUE),
+            se = sem(log(ast_sgot))) %>%
+  ungroup() %>%
+  mutate(lower = mean - (z*se),
+         upper = mean + (z*se),
+         day = ifelse(any_ecmo=='Yes', day+0.2, day)) # jitter x slightly to avoid overlap
+tplot = ggplot(data=to_stat, aes(x=day, y=mean, ymin=lower, ymax=upper, col=factor(any_ecmo)))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  xlab('Day in ICU')+
+  ylab('Log-transformed AST-SGOT')+
+  scale_color_manual('Any ECMO', values=c('darkorange1','cyan4'))+
+  g.theme
+tplot
+```
+
+Just for the first 21 days and the `r length(unique(to_plot$pin))` patients in ICU.
+
+The y-axis is for the log-transformed value.
+
+## Anticoagulants in the last 24 hours
+
+```{r, fig.width=8}
+to_plot = mutate(to_plot, facet = paste("Any ECMO = ", any_ecmo, sep=''), # nice facet
+                 eotd_anticoagulants_plot = ifelse(is.na(eotd_anticoagulants), 2, eotd_anticoagulants)) # replace missing %>%
+bplot = ggplot(data=to_plot, aes(x=factor(day), fill=factor(eotd_anticoagulants_plot)))+
+  geom_bar(position='stack')+
+  xlab('Day in ICU')+
+  ylab('Number of patients')+
+  scale_fill_manual('Anticoagulants', values=c('indianred1','cyan3','grey'), labels=c('No','Yes','Missing'))+
+  g.theme+
+  theme(axis.text.x = element_text(size=5))+ # reduce label size
+  facet_wrap(~facet, scales='free_y')
+bplot
+```
+
+The y-axes on the two panels differ because there are far fewer patients in the ECMO group.
+
+## Anticoagulants type in the last 24 hours
+
+```{r, fig.width=8}
+to_plot_anti = filter(to_plot, eotd_anticoagulants_type!='')
+colours = gg_color_hue(10)
+bplot = ggplot(data=to_plot_anti, aes(x=factor(day), fill=factor(eotd_anticoagulants_type)))+
+  geom_bar(position='stack')+
+  xlab('Day in ICU')+
+  ylab('Number of patients')+
+  scale_fill_manual(NULL, values=colours)+
+  g.theme+
+  theme(axis.text.x = element_text(size=5))+ # reduce label size
+  facet_wrap(~facet, scales='free_y')
+bplot
+```
+
+The y-axes on the two panels differ because there are far fewer patients in the ECMO group.
+
+## Haemorrhagic complication
+
+```{r, fig.width=8}
+to_plot = mutate(to_plot, eotd_haemorrhagic_complication_plot = ifelse(is.na(eotd_haemorrhagic_complication), 2, eotd_haemorrhagic_complication)) # make extra category for missing
+bplot = ggplot(data=to_plot, aes(x=factor(day), fill=factor(eotd_haemorrhagic_complication_plot)))+
+  geom_bar(position='stack')+
+  xlab('Day in ICU')+
+  ylab('Number of patients')+
+  scale_fill_manual('Haemorrhagic\ncomplication', values=c('indianred1','cyan3','grey'), labels=c('No','Yes','Missing'))+
+  g.theme+
+  theme(axis.text.x = element_text(size=5))+ # reduce label size
+  facet_wrap(~facet, scales='free_y')
+bplot
+```
+
+The y-axes on the two panels differ because there are far fewer patients in the ECMO group.
+
+## Source of Haemorrhagic Complication 
+
+```{r, results='asis'}
+to_table = filter(to_plot, eotd_haemorrhagic_complication==1)
+freq(to_table$eotd_haemorrhagic_complication_source, cumul=FALSE, report.nas = FALSE)
+```
+
+Just for the `r nrow(to_table)` days with a haemorrhagic complication in the first 21 days. The total number of patients is `r length(unique(to_table$pin))`.
+
+### Number of patients with "central nervous system"
+
+```{r, include=FALSE}
+to_count = filter(to_plot, eotd_haemorrhagic_complication==1,
+                  eotd_haemorrhagic_complication_source == 'Central nervous system'
+                  ) %>%
+  select(pin, complication_stroke) %>%
+  unique()
+n_patients_cns = nrow(to_count)
+```
+
+The previous table is the number of days and so contains repeated days from the same patients. The number of unique patients with at least one day of "central nervous system" is `r n_patients_cns`.
+
+The table below shows whether these `r n_patients_cns` patients also had stroke (using the complication data).
+
+```{r, results='asis'}
+freq(to_count$complication_stroke, cumul=FALSE, report.nas = TRUE)
+```
+
+# Stroke
+
+## Number of strokes
+
+```{r, results='asis'}
+tab_stroke = with(patients, freq(complication_stroke, round.digits=0, report.nas	=FALSE, cumul = FALSE))
+tab_stroke
+```
+
+## Stroke types
+
+
+```{r}
+# add ggupset
+cplot = ggplot(filter(patients, complication_stroke=='Yes'), aes(x = stroke_type)) +
+    geom_bar(aes(y=..count..), fill='seagreen') +
+    theme_bw() +
+    xlab("") +
+    ylab("Number of patients") +
+    scale_x_upset( )+
+    g.theme+
+  theme(plot.margin = margin(t = 5, r = 0, b = 0, l = 110, unit = "pt"))
+cplot
+```
+
+This is a new variable which was added in August 2020. Up to two options for the stroke type variable could be ticked. The plot is just for the `r sum(patients$complication_stroke=='Yes', na.rm=TRUE)` patients with a stroke complication.
+
+The third most common response is missing stroke type, which reflects the fact that the data is being added retrospectively. The most common response with complete data is "Intraparenchymal haemorrhage". 
+
+## Association between a cannula in the internal jugular vein and stroke/ICH/death
+
+The table below shows the association between insertion site and stroke complication.
+
+```{r}
+tab = group_by(ecmo_patients, ecmo_drainage_cannula_insertion_site, complication_stroke) %>%
+  tally() %>%
+  group_by(ecmo_drainage_cannula_insertion_site) %>%
+  mutate(percent = prop.table(n)*100,
+    cell = paste(n, ' (', roundz(percent, digits=0), ')', sep='')) %>%
+  ungroup() %>%
+  mutate(ecmo_drainage_cannula_insertion_site = ifelse(ecmo_drainage_cannula_insertion_site=='', 'Missing', ecmo_drainage_cannula_insertion_site ),
+    complication_stroke = ifelse(is.na(complication_stroke), 'Missing', as.character(complication_stroke))) %>%
+  select(ecmo_drainage_cannula_insertion_site, complication_stroke, cell) %>%
+  spread(complication_stroke, cell)
+#
+table_header <- data.frame(
+  col_keys = c( 'ecmo_drainage_cannula_insertion_site', 'Missing', 'No', 'Yes' ),
+  h1 = c('', rep("Stroke complication", 3)),
+  h2 = c('Drainage cannula insertion site', 'Missing', 'No', 'Yes'),
+  stringsAsFactors = FALSE )
+#
+ftab = flextable(tab) %>%
+ set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+ merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+The table shows the number of patients and the row percentage.
