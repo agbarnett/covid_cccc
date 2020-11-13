@@ -36,7 +36,7 @@ cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00",
 
 ## get the data
 source = 'real_data'
-source = 'dummy_data'
+#source = 'dummy_data'
 if(source == 'dummy_data'){
   load(file='data/COVID_Data_stroke_dummy.RData') # from 0_read_data.R, dummy data
   # fixes with stroke
@@ -58,10 +58,10 @@ censor_day = 90 # maximum day for plots and estimates
 # slim down variables:
 patients = select(patients, 'pin', 'site_name','country','age', 'sex', 'bmi','ethnicity', 'pregnant',
                   'date_icu','date_ecmo','date_ecmo_discontinued',
-                  'date_death','date_discharge','last_date',
+                  'date_death','date_discharge','last_date','date_first_symptom',
+                  'date_mech_vent_discontinued', 'date_mechanical_ventilation',
                   "height","weight",'date_admission','date_hospital_discharge',
-                  'comorbidity_chronic_kidney_disease','comorbidity_severe_liver_disease',
-                  'comorbidity_diabetes','comorbidity_hypertension',
+                  starts_with('comorbidity_'),
                   'sofa','apache_ii',
                   'ecmo_type','ecmo_drainage_cannula_insertion_site',
                   'ecmo_return_cannula_insertion_site',
@@ -111,6 +111,8 @@ patients  = mutate(patients,
          comorbidity_hypertension = factor(comorbidity_hypertension, levels=0:1, labels=c('No','Yes')),
          ecmo_cardiac_arrest_before = factor(ecmo_cardiac_arrest_before, levels=0:1, labels=c('No','Yes')),
          ecmo_continuous_rpt_before = factor(ecmo_continuous_rpt_before, levels=0:1, labels=c('No','Yes')),
+         any_mv = as.numeric(!is.na(date_mechanical_ventilation)),
+         any_mv = factor(any_mv, levels=0:1, labels=c('No','Yes')),
          any_ecmo = as.numeric(ecmo_type!=''),
          any_ecmo = factor(any_ecmo, levels=0:1, labels=c('No','Yes')))
 
@@ -152,7 +154,7 @@ Patients were excluded for:
 ```{r}
 # a) no stroke date
 f = filter(patients, complication_stroke=='Yes') %>%
-  select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge) 
+  select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge, date_hospital_discharge) 
 n_start = nrow(f) # starting number
 n_missing_stroke_date = sum(is.na(f$complication_stroke_date)) # number excluded for missing stroke
 # b) stroke before ICU admission
@@ -161,21 +163,21 @@ f2 = filter(f,
 n_update = nrow(f2)
 f2 = filter(f2, complication_stroke_date >= date_icu)
 n_stroke_prior_icu = n_update - nrow(f2) # number excluded
-# c) stroke after ICU discharge
-f3 = filter(f2, complication_stroke_date <= date_discharge | !is.na(date_discharge))
+# c) stroke after hospital discharge
+f3 = filter(f2, complication_stroke_date <= date_hospital_discharge | !is.na(date_hospital_discharge))
 n_stroke_post_icu = nrow(f2) - nrow(f3)
 n_final = nrow(f3)
 ```
 
 We start with `r n_start` patients who had a stroke.
-Of these patients `r n_missing_stroke_date` have no stroke date, `r n_stroke_prior_icu` patients had their stroke prior to their ICU admission, and `r n_stroke_post_icu` patients had their stroke after their ICU discharge.
-This gives `r n_final` patients with a known stroke date during their ICU admission.
+Of these patients `r n_missing_stroke_date` have no stroke date, `r n_stroke_prior_icu` patients had their stroke prior to their ICU admission, and `r n_stroke_post_icu` patients had their stroke after their hospital discharge.
+This gives `r n_final` patients with a known stroke date during their ICU admission (_to check, should this be hospital?_).
 
 # Descriptive statistics
 
 The tables below are split by the three types of stroke: Hemorrhage, Ischemic and Other/Unknown. There is also a columns for patients with no stroke.
 
-```{r}
+```{r, continuous_table}
 #
 ftab = desc_table_cont(
   indata=patients, 
@@ -190,9 +192,21 @@ table_nums(name="cont_table","Continuous variables - table.", level=2) # title
 ftab
 ```
 
-```{r}
+```{r, categorical_table}
+# combine ethnicity
+patients = mutate(patients,
+                  Ethnicity = case_when(
+                    ethnicity == 'aboriginal'  ~ 'other',
+                    ethnicity == 'arab'  ~ 'other',
+                    ethnicity == 'east_asian'  ~ 'Asian',
+                    ethnicity == 'west_asian'  ~ 'Asian',
+                    ethnicity == 'south_asian'  ~ 'Asian',
+                    ethnicity == 'latin_american'  ~ 'Hispanic',  
+                    TRUE ~ as.character(ethnicity) # all others remain the same
+                  ) )
+#
 ftab = desc_table_cat(indata = patients, 
-                      vars = c('sex','ethnicity','country'), 
+                      vars = c('any_ecmo','any_mv','sex','Ethnicity','country'), 
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
@@ -201,7 +215,19 @@ table_nums(name="cat_table","Categorical variables.", level=2) # title
 ftab
 ```
 
-```{r}
+```{r, comorbid_table}
+co_vars = c(  'comorbidity_chronic_kidney_disease','comorbidity_malignant_neoplasm','comorbidity_smoking')
+ftab = desc_table_cat(indata = patients, 
+                      vars = co_vars, 
+                      group_var = 'stroke_group', 
+                      var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+                      include_total = FALSE,
+                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None') )
+table_nums(name="comorb_table","Comorbidities.", level=2) # title
+ftab
+```
+
+```{r, pregnant_table}
 to_tab = filter(patients, sex=='Female')
 ptab = ftab = desc_table_cat(indata = to_tab, 
                       vars = c('pregnant'), 
@@ -213,7 +239,33 @@ table_nums(name="preg_table","Pregnant (women only).", level=2) # title
 ptab
 ```
 
-```{r}
+
+
+```{r, time_table}
+# create time variables
+patients = mutate(patients,
+      date_end = ifelse(is.na(date_discharge)==FALSE, date_hospital_discharge, date_death), # end date of death or discharge
+      date_end = as.Date(date_end, origin='1970-01-01'),
+      days_symptoms_hosp = as.numeric(date_admission - date_first_symptom) +0.5, 
+      days_hosp = as.numeric(date_end - date_admission) + 0.5,
+      duration_ecmo = as.numeric(date_ecmo_discontinued - date_ecmo) + 0.5,
+      duration_mv = date_mech_vent_discontinued - date_mechanical_ventilation +0.5)
+#
+time_vars = c('days_symptoms_hosp','days_hosp','duration_ecmo','duration_mv')
+#
+ftab = desc_table_cont(indata = patients, 
+                      vars = time_vars, 
+                      group_var = 'stroke_group', 
+                      var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+                      include_total = FALSE,
+                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) %>% 
+   fontsize(part='all', size=8) %>% # smaller font size to fit
+  autofit()
+table_nums(name="time_table", "Time variables (in days)", level=2) # title
+ftab
+```
+
+```{r, outcome_table}
 ftab = desc_table_cat(indata = patients, 
                       vars = 'outcome', 
                       group_var = 'stroke_group', 
@@ -223,13 +275,12 @@ ftab = desc_table_cat(indata = patients,
 table_nums(name="outcome_table", "Final outcome", level=2) # title
 ftab
 ```
-
 # Model diagram
 
 The figure below shows the four states in the multi-state survival model. Patients start at ICU admission.
 
 ```{r}
-states = c('ICU\nadmission','Stroke','Death','ICU\ndischarge')
+states = c('ICU\nadmission','Stroke','Death','Hospital\ndischarge')
 # Matrix of joins between states:
 M = matrix(data=c(
   2,1,
@@ -252,6 +303,7 @@ This table shows the transitions (movements) between the states (`r figure_nums(
 my.data = time_transitions(
   indata = patients, 
   start_state = 'date_icu',
+  discharge_date = 'date_hospital_discharge', # hospital discharge
   int_state = 'complication_stroke_date', # intermediate state
   int_state_end = NULL, # no movement out of stroke
   censor_day = censor_day, 
@@ -279,7 +331,7 @@ my.data.stroke = my.data[index,]
 #
 not.there = f2$pin[f2$pin%in% my.data$id ==FALSE] # stroke patients not in the transition data
 check = filter(patients, pin%in% not.there) %>%
-    select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge) 
+    select(pin, date_icu, complication_stroke_date, last_date, date_death, date_hospital_discharge) 
 ```
 
 ```{r}
@@ -658,7 +710,7 @@ run_cox_models = function(in_discharge, in_death, digits=2){
   # cox
   in_discharge = mutate(in_discharge,
     days = ifelse(is.na(days)==TRUE, cens, days)) # get days from censored or uncensored
-  c_disch = coxph(Surv(days, event=cens==0, type='right') ~ sex + age + bmi + stroke + cluster(site), data=in_discharge)
+  c_disch = coxph(Surv(days, event=cens==0, type='right') ~ sex + age + bmi + stroke_o + stroke_i + stroke_h + cluster(site), data=in_discharge)
   ests_disch = tidy(c_disch, conf.int = TRUE, exponentiate = TRUE) %>%
     mutate(
       estimate = roundz(estimate, digits),
@@ -676,7 +728,7 @@ run_cox_models = function(in_discharge, in_death, digits=2){
   # cox
   in_death = mutate(in_death,
             days = ifelse(is.na(days)==TRUE, cens, days)) # get days from censored or uncensored
-  c_death = coxph(Surv(days, event=cens == 0, type='right') ~ sex + age + bmi + stroke + cluster(site), data=in_death)
+  c_death = coxph(Surv(days, event=cens == 0, type='right') ~ sex + age + bmi + stroke_o + stroke_i + stroke_h + cluster(site), data=in_death)
   ests_death = tidy(c_death, conf.int = TRUE, exponentiate = TRUE) %>%
     mutate(
       estimate = roundz(estimate, digits),
@@ -701,7 +753,10 @@ run_cox_models = function(in_discharge, in_death, digits=2){
 }
 cox_models = run_cox_models(in_discharge = for_discharge, in_death = for_death) # run above function
 for_tab = cox_models$table %>% 
-  select(term, HR1, CI1, HR2, CI2) 
+  select(term, HR1, CI1, HR2, CI2) %>%
+  mutate(term = ifelse(term=='stroke_o', 'Stroke - Other/Unknown', term),
+         term = ifelse(term=='stroke_i', 'Stroke - Ischemic', term),
+         term = ifelse(term=='stroke_h', 'Stroke - Hemorrhage', term))
 ## nice table
   header = read.table(header=TRUE, stringsAsFactors = FALSE, sep="!", text='
 col_keys!colB!colA

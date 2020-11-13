@@ -105,17 +105,11 @@ daily_ecmo = left_join(for_join, daily, by=c('pin','date_daily'))
 ```{r, include=FALSE}
 ### prepare data for survival analysis ###
 ## ---- transitions
-#my.data = time_transitions_ecmo_prone(indata=patients, censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
-#  select(pin, from, to, start, end, date_ecmo, age, any_prone, sex, bmi, site_name, site_num, country, #ecmo_prone_before) %>%
-#  rename(id = pin, # rename to suit Martin's use
-#         entry = start,
-#         exit = end)
-
-#
 my.data = time_transitions(indata=patients, 
                            start_state='date_ecmo',
                            int_state = 'prone_start',
                            int_state_end = 'prone_end', 
+                           discharge_date = 'date_hospital_discharge',
                            censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
   select(pin, from, to, start, end, date_ecmo, age, any_prone, sex, bmi, site_name, country, ecmo_prone_before) %>%
   rename(id = pin, # rename to suit Martin's use
@@ -166,9 +160,10 @@ We show the statistics for the two groups of: "no prone" and "some prone", based
 
 ```{r}
 #
+cont_vars = c('age','bmi','sofa','apache_ii')
 ftab = desc_table_cont(
   indata=patients, 
-  vars = c('age','bmi','sofa','apache_ii'), 
+  vars = cont_vars, 
   group_var = 'any_prone', 
   var_levels=c('No','Yes'),
   heading = c('No prone','Some prone'),
@@ -194,8 +189,8 @@ hplot
 
 
 ```{r}
-cont_vars = c('compliance_respiratory_system','eotd_peep','pa_o2','eotd_fi_o2','pa_o2_fi_o2')
-ftab = desc_table_cont(indata=daily_ecmo, vars=cont_vars, group_var='any_prone', heading=c('No prone','Some prone')) # see 99_functions.R
+cont_vars = c('compliance_respiratory_system','eotd_peep','pa_co2','pa_o2','eotd_fi_o2','pa_o2_fi_o2')
+ftab = desc_table_cont(indata=daily_ecmo, vars=cont_vars, group_var='any_prone', var_levels=c('No','Yes'), heading=c('No prone','Some prone')) # see 99_functions.R
 table_nums(name="cont_table_daily","Continuous variables from daily data.", level=2) # title
 ftab
 ```
@@ -203,6 +198,7 @@ ftab
 These are the continuous variables that are collected daily. Here we show the results for the date the patient started ECMO.
 
 ```{r}
+#
 ftab = desc_table_cat(indata = patients, 
                       vars = c('sex','ethnicity','country','pre_ecmo_vent','ecmo_prone_before'), 
                       group_var = 'any_prone', 
@@ -245,7 +241,7 @@ ftab
 ```{r}
 # create time variables
 patients = mutate(patients,
-      date_end = ifelse(is.na(date_discharge)==FALSE, date_discharge, date_death), # end date of death or discharge
+      date_end = ifelse(is.na(date_hospital_discharge)==FALSE, date_hospital_discharge, date_death), # end date of death or discharge
       date_end = as.Date(date_end, origin='1970-01-01'),
       days_symptoms_hosp = as.numeric(date_admission - date_first_symptom) +0.5, 
       days_hosp = as.numeric(date_end - date_admission) + 0.5,
@@ -257,7 +253,7 @@ patients = mutate(patients,
 #
 time_vars = c('days_symptoms_hosp','days_hosp','duration_mv','dur_pre_ecmo_vent','duration_prone')
 #
-ftab = desc_table_cont(indata=patients, vars=time_vars, group_var='any_prone', heading=c('No prone','Some prone')) # see 99_functions.R
+ftab = desc_table_cont(indata=patients, vars=time_vars, group_var='any_prone', var_levels = c('No','Yes'), heading=c('No prone','Some prone')) # see 99_functions.R
 table_nums(name="time_table", "Time variables (in days)", level=2) # title
 ftab
 ```
@@ -303,16 +299,21 @@ ftab
 
 ```{r, fig.width=8, fig.height=6.5}
 # calculate number in ECMO beds and number prone every day
-time_dates = select(patients, pin, ecmo_start, ecmo_end, prone_start, prone_end)
+time_dates = select(patients, pin, date_ecmo, date_ecmo_discontinued, prone_start, prone_end)
 denom = numer = NULL
 for (k in 1:nrow(time_dates)){
-if(!is.na(time_dates$ecmo_start[k])){denom = c(denom, seq(time_dates$ecmo_start[k], time_dates$ecmo_end[k], 1))}
-if(!is.na(time_dates$prone_start[k])){numer = c(numer, seq(time_dates$prone_start[k], time_dates$prone_end[k], 1))}
+  if(!is.na(time_dates$date_ecmo[k])&!is.na(time_dates$date_ecmo_discontinued[k])){
+    if(time_dates$date_ecmo_discontinued[k] >= time_dates$date_ecmo[k]){ # remove few errors
+      denom = c(denom, seq(time_dates$date_ecmo[k], time_dates$date_ecmo_discontinued[k], 1))
+    }
+  }
+  if(!is.na(time_dates$prone_start[k])){numer = c(numer, seq(time_dates$prone_start[k], time_dates$prone_end[k], 1))}
 }
 prone_count = data.frame(table(numer)); names(prone_count) = c('date','numer')
 denom_count = data.frame(table(denom)); names(denom_count) = c('date','denom')
 counts = full_join(prone_count, denom_count, by='date') %>%
-  mutate(not = denom - numer, # numbers not on ECMO
+    replace(., is.na(.), 0) %>% # replace NA with zero
+    mutate(not = denom - numer, # numbers not on ECMO
          date = as.Date(as.numeric(as.character(date)), origin='1970-01-01'))
 # data for plot 1
 dplot1 = select(counts, date, not, numer) %>%
@@ -335,7 +336,7 @@ plot1 = ggplot(data=dplot1, aes(x=date, y=count, fill=factor(type)))+
 # plot 2
 plot2 = ggplot(data=dplot2, aes(x=date, y=p))+
   geom_line()+
-  geom_smooth()+
+  geom_smooth(method='loess', span=0.85)+
   scale_x_continuous(breaks=x_breaks, labels=month.abb)+
   ylab('Percent of prone patients')+
   xlab('Date')+
@@ -359,7 +360,7 @@ We do not have the exact calendar time because dates have been scrambled by arou
 The figure below shows the four states in the multi-state survival model. Patients start in the "ECMO & supine" state on the day they begin ECMO. Patients in the prone position on their first day of ECMO start in the "ECMO & Prone" state. Patients can move from Supine to Prone, and back from Prone to Supine.
 
 ```{r}
-states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge\nfrom ICU')
+states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge\nfrom hospital')
 # Matrix of joins between states:
 M = matrix(data=c(
   2,1,
@@ -370,9 +371,9 @@ M = matrix(data=c(
   4,2
 ), byrow = TRUE, ncol=2)
 figure_nums(name="model_diagram", "The four states in the model and the possible movements between states", level=1) # title
-multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65) # see 99_functions.R
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
 jpeg(filename='figures/prone/state_diagram.jpg', width=4, height=4, units='in', res=400, quality = 100)
-multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65) # see 99_functions.R
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
 invisible(dev.off())
 ```
 
@@ -659,16 +660,16 @@ LOS_mat_tab = as.data.frame(both_mat)
 LOS_mat_tab$from = states
 LOS_mat_tab = LOS_mat_tab[1:2,] # discard death and discharge from rows
 # add death risk
-LOS_mat_tab = left_join(LOS_mat_tab, preds, by='from') %>%
-  select(from, everything()) # from from to start
+#LOS_mat_tab = left_join(LOS_mat_tab, preds, by='from')
+LOS_mat_tab  = select(LOS_mat_tab, from, everything()) # from from to start
 #
 
 ## nice table
 # table header
 table_header <- data.frame(
-  col_keys = c( 'from', states, 'death' ),
-  h1 = c('', rep("State moved to", 4), ""),
-  h2 = c('State moved from', states, 'Percent dead'),
+  col_keys = c( 'from', states), #, 'death' ),
+  h1 = c('', rep("State moved to", 4)),#, ""),
+  h2 = c('State moved from', states),#, 'Percent dead'),
   stringsAsFactors = FALSE )
 # make table
 ftab = flextable(LOS_mat_tab) %>%
@@ -677,7 +678,7 @@ ftab = flextable(LOS_mat_tab) %>%
  theme_box() %>% # nice theme
  align(align='center', part='all') %>% # centre text
  autofit()
-table_nums('elos', 'Expected length of stay in days and death probability', level=1) # title, increase level
+table_nums('elos', 'Expected length of stay in days', level=1) # title, increase level
 ftab
 ```
 
@@ -685,7 +686,7 @@ The table shows expected lengths of stay between states, with the current state 
 
 The days in parentheses are 95% confidence intervals based on `r B` bootstrap replications.
 
-The right-most column shows the estimated death percentage and standard error in parentheses.
+<!--- The right-most column shows the estimated death percentage and standard error in parentheses.--->
 
 The results use `r n_patients` patients.
 
@@ -846,7 +847,7 @@ for_discharge = prepare_survival(indata=my.data, cens_events=c('1','2','4','cens
 # could remove individual effect, it is not helping much
 n.chains= 2
 MCMC = 10000 # increase to 10,000 for final run
-thin = 5 # increase to 5?
+thin = 5 # increase to 5 for final run
 
 # initial values for single variable outcome (use mean for intercept)
 inits = list(r=1, beta=rep(0,6), int=0, tau.centre=1, centre=rep(0, for_death$M), patient=rep(0, for_death$P), tau.id=1, mu.bmi=0, tau.bmi=1, p=0.74) 
@@ -866,7 +867,7 @@ if(any_model == TRUE){
   load('results/survival_bugs_death.RData')
 }
 # b) discharge
-any_model = length(dir(path='results', pattern='bugs_discharge')) > 0
+any_model = length(dir(path='results', pattern='bugs_discharge\\.RData')) > 0
 # run model
 if(any_model == FALSE){
   bugs_results_discharge = bugs(data=for_discharge, inits=inits, parameters=parameters, model.file=bfile, DIC=FALSE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
@@ -1018,7 +1019,7 @@ The plots above show the cumulative predicted probabilities of death and dischar
 
 # Statistical methods section for paper
 
-We used multi-state survival analysis to examine this data because there are key changes that happen over time during a patient's ICU stay that must be accounted for. A simple cross-sectional analysis, e.g., examining the association between a patient experiencing any prone position (yes/no) and death (yes/no) using a chi-squared test or similar, over-simplifies the data and can introduce serious biases, such as the time-dependent bias [@Beyersmann08]. A simple approach also ignores the issue of competing risks, which can easily lead to flawed results and conclusions [@Wolkewitz2014]. In this case death and ICU discharge are competing events, because once a patient has experienced one, they cannot experience the other. Because of this issue we used cumulative incidence plots to graphically show events over time rather than the more familiar Kaplan-Meier plots, because Kaplan-Meier plots generally over-estimate cumulative risks when there are competing events [@Wolkewitz2014].
+We used multi-state survival analysis to examine this data because there are key changes that happen over time during a patient's ICU stay that must be accounted for. A simple cross-sectional analysis, e.g., examining the association between a patient experiencing any prone position (yes/no) and death (yes/no) using a chi-squared test or similar, over-simplifies the data and can introduce serious biases, such as the time-dependent bias [@Beyersmann08]. A simple approach also ignores the issue of competing risks, which can easily lead to flawed results and conclusions [@Wolkewitz2014]. In this case death and discharge are competing events, because once a patient has experienced one, they cannot experience the other. Because of this issue we used cumulative incidence plots to graphically show events over time rather than the more familiar Kaplan-Meier plots, because Kaplan-Meier plots generally over-estimate cumulative risks when there are competing events [@Wolkewitz2014].
 
 We used a multi-state model with four states (see `r figure_nums("model_diagram", display = "cite")`). 
 Patients started in the prone or supine states, and could move between these states during their ECMO treatment. 
@@ -1041,6 +1042,61 @@ All the R and WinBUGS code used in the analysis is available here: https://githu
 
 <!--- A good recent introduction to survival analysis is @Andersen2020. --->
 
+
+## Alertness over time
+
+```{r}
+# turn my.data into long data (daily)
+long = NULL
+my.data.cens = mutate(my.data,
+                      to = ifelse(to=='cens', '0', to)) %>%
+  filter(exit - entry > 0.5) # remove few small jumps
+for (k in 1:nrow(my.data.cens)){
+  this_row = my.data.cens[k,]
+  f = data.frame(pin=this_row$id, days=seq(this_row$entry, this_row$exit-1, 1), state=as.numeric(this_row$from))
+  f_last = data.frame(pin=this_row$id, days=this_row$exit, state=as.numeric(this_row$to))
+  long = bind_rows(long, f, f_last)
+}
+# quick check
+check = group_by(long, days, state) %>%
+  tally()
+cplot = ggplot(data=check, aes(x=days, y=n, fill=factor(state)))+
+  geom_bar(stat='identity')
+#cplot
+
+# get daily data
+small = select(patients, pin, date_ecmo)
+to_plot = full_join(daily, small, by='pin') %>%
+  mutate(days = as.numeric(date_daily - date_ecmo)) %>%
+  filter(!is.na(days),
+         days >= 0,
+         days <= censor_day) %>%
+  select(pin, days, date_daily, glasgow_coma_score, avpu)
+
+# merge with state information
+to_plot = left_join(to_plot, long, by=c('pin','days')) %>%
+  filter(state %in% c(1,2)) # just supine and prone
+
+# daily mean by state
+to_plot_mean = group_by(to_plot, days, state) %>%
+  summarise(#meana = mean(avpu, na.rm=TRUE), # categorical
+            meang = mean(glasgow_coma_score, na.rm=TRUE)) %>%
+  filter(!is.na(meang))
+# plot
+gplot = ggplot(data=to_plot_mean, aes(x=days, y=meang, col=factor(state)))+
+  geom_point()+
+  scale_color_manual(NULL, labels=c('Supine','Prone'), values=1:2)+
+  geom_smooth(span=0.9)+
+  xlab('Days since ECMO start')+
+  ylab('Average Glasgow coma score')+
+  theme_bw()+
+  theme(legend.position = c(0.15,0.85))
+figure_nums(name="glasgow_plot", "Plot of daily average Glasgow coma scores by position.") # title
+gplot
+```
+
+
+The plot shows a steady rise in score in the supine position. The patterns in the prone group are divergent, but are reliant on a small number of patients.
 
 ### Addition details for a methods appendix
 
@@ -1569,7 +1625,7 @@ for (this_country in countries){
   for_death = prepare_survival(indata=data.to.use, cens_events=c('1','2','3','cens')) # supine, prone, discharge or admin censored; event is death ('4')
   for_discharge = prepare_survival(indata=data.to.use, cens_events=c('1','2','4','cens')) # supine, prone, death or admin censored; event is discharge ('3')
   ests = run_cox_models(in_discharge = for_discharge, in_death = for_death, digits=10)$table %>% # run above function to run Cox models
-    filter(str_detect(term, 'prone')) %>%
+    filter(str_detect(term, 'prone$')) %>% # not prone before
     select('HR1','conf.low1','conf.high1','HR2','conf.low2','conf.high2') %>%
     mutate_all(~as.numeric(.x)) %>% # change rounded numbers back to numbers
     mutate(country = this_country)
@@ -1599,7 +1655,7 @@ grid.arrange(leave_plot1, leave_plot2, ncol=2)
 The plot shows the mean hazard ratio (dot) and 95% confidence interval.
 The estimates change when the USA is left out. This is because the one very influential patient is from the USA.
 
-## Checking convergence for Bayesian models
+## Convergence of Bayesian models
 
 Here we visually check the convergence of the estimates for the Bayesian survival models. We plot the intercept (int), regression parameters (beta 1 to 5), and Weibull shape parameter (r).
 

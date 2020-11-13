@@ -38,7 +38,20 @@ g.theme = theme_bw() + theme(panel.grid.minor = element_blank())
 cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#999999", "#CC79A7")
 
 ## get the data
-load(file='data/COVID_Data_stroke.RData') # from 0_read_data.R
+source = 'real_data'
+#source = 'dummy_data'
+if(source == 'dummy_data'){
+  load(file='data/COVID_Data_stroke_dummy.RData') # from 0_read_data.R, dummy data
+  # fixes with stroke
+  patients = mutate(patients,
+          stroke_group = ifelse(is.na(complication_stroke_date)==TRUE, 'None', stroke_group), # blank stroke group for those with no date
+          stroke_group = ifelse(is.na(complication_stroke_date)==FALSE, sample(c('Hemorrhage','Ischemic','Other/Unknown','None'), size=n(), replace=TRUE), stroke_group) # randomly add stroke group for those with a date
+                    )
+}
+if(source == 'real_data'){
+  load(file='data/COVID_Data_stroke.RData') # from 0_read_data.R
+}
+
 # make last possible date based on database freeze
 last_possible = as.Date(paste(data_date$day, data_date$month, '2020', sep='-'), format='%d-%b-%Y')
 
