@@ -235,12 +235,6 @@ desc_table_cont = function(
     if(include_total==TRUE){
     tab_total = select(indata, pin, all_of(vars)) %>%
       tidyr::gather(key='Variable', value='Value', -pin) %>%
-      # nice variable names:
-      mutate(Variable = ifelse(Variable=='days_hosp', 'Days in hospital', Variable),
-      Variable = ifelse(Variable=='days_symptoms_hosp', 'Days between symptoms and hospital', Variable),
-      Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
-      Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable),
-      Variable = str_replace_all(Variable, pattern='_', replacement=' ')) %>%
       group_by(Variable) %>%
       summarise(Missing = sum(is.na(Value)),
                 Median = roundz(median(Value, na.rm=TRUE),0),
@@ -251,6 +245,14 @@ desc_table_cont = function(
       mutate(group_var = 'Total')
     tab = bind_rows(tab, tab_total)
     }
+    # nice variable names (continuous):
+    tab = mutate(tab,
+           Variable = ifelse(Variable=='duration_ecmo', 'Duration of ECMO', Variable),
+           Variable = ifelse(Variable=='duration_mv', 'Duration of MV', Variable),
+           Variable = ifelse(Variable=='days_hosp_stroke', 'Days from hospital admission to stroke', Variable),
+           Variable = ifelse(Variable=='days_hosp', 'Days in hospital', Variable),
+           Variable = ifelse(Variable=='days_symptoms_hosp', 'Days between symptoms and hospital', Variable),
+           Variable = str_replace_all(Variable, pattern='_', replacement=' ')) 
     # columns in the right order:
     columns = c('Variable', paste(rep(var_levels, each=3), c('_Missing','_Median','_IQR'), sep=''))
     if(include_total == TRUE){columns = c(columns, 'Total_Missing','Total_Median','Total_IQR')}
@@ -294,11 +296,7 @@ desc_table_cat = function(indata,
     tidyr::gather(key='Variable', value='Value', -pin, -group_var) %>%
     mutate( # explicit missing:
       Value = ifelse(Value=='', 'Missing', Value),
-      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value),
-      # nice variable names:
-      Variable = ifelse(Variable=='duration_ecmo', 'Duration of ECMO', Variable),
-      Variable = ifelse(Variable=='duration_mv', 'Duration of MV', Variable),
-      Variable = str_replace_all(Variable, pattern='_', replacement=' ')) %>%
+      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value)) %>%
     group_by(Variable, group_var, Value) %>%
     tally() %>%
     group_by(Variable, group_var) %>%
@@ -310,10 +308,7 @@ desc_table_cat = function(indata,
     tidyr::gather(key='Variable', value='Value', -pin) %>%
     mutate( # explicit missing:
       Value = ifelse(Value=='', 'Missing', Value),
-      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value),
-      # nice variable names:
-      Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
-      Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable)) %>%
+      Value = ifelse(is.na(Value)==TRUE, 'Missing', Value)) %>%
     group_by(Variable, Value) %>%
     tally() %>%
     group_by(Variable) %>%
@@ -322,6 +317,11 @@ desc_table_cat = function(indata,
     mutate(group_var = 'Total')
   tab = bind_rows(tab, tab_total) # add totals
   }
+  # nice variable names (categorical):
+  tab = mutate(tab,
+  Variable = str_remove_all(Variable, pattern='comorbidity_'),
+  Variable = ifelse(Variable=='ecmo_prone_before', 'Prone Position Before ECMO', Variable),
+  Variable = ifelse(Variable=='pre_ecmo_vent', 'Ventilatory Mode Before Start Of ECMO', Variable))
   # columns in the right order:
   columns = c('Variable','Value', paste(rep(var_levels, each=2), c('_n','_Percent'), sep=''))
   if(include_total == TRUE){columns = c(columns, 'Total_n','Total_Percent')}
