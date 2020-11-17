@@ -369,7 +369,7 @@ table_nums(name="transitions", "Transition numbers between states") # title
 ftab
 ```
 
-## Survival models for stroke
+## Survival models for time to stroke
 
 We use a Cox survival model to examine the time to stroke, examining ischemic stroke and hemorrhagic stroke separately. This models the time to stroke whilst accounting for censoring due to death and discharge, or administrative censoring if the patient is still in hospital at the end of the study.
 
@@ -436,6 +436,8 @@ ftab
 ```
 
 The table shows the hazard ratios and 95% confidence intervals for the three types of stroke. I used two predictors of age and sex which are almost 100% complete. I added SOFA score but the models did not converge.
+
+The confidence intervals for the effects of age and sex are relatively wide for some estimates, which also is likely because of the small number of strokes.
 
 ### Cumulative risk plot for stroke
 
@@ -885,7 +887,7 @@ figure_nums(name="site_death", "Site effects from the Weibull survival model for
 cplot
 ```
 
-The hazard ratio axis is on log scale (base 10). Each row is a site and there are two estimates per site: one for death and one for discharge. The sites are ordered from lowest to highest risk. The plot has been split into two panels because of the number of sites.
+The hazard ratio axis is on log scale (base 10). Each row is a site and there are two estimates per site: one for death and one for discharge. The sites are ordered from lowest to highest risk. The plot has been split into two panels because of the number of sites. There are a few sites where the hazards of death or discharge are quite different from other sites.
 
 ### Alternative Cox survival models for death and discharge
 
@@ -1001,26 +1003,102 @@ There are strong non-proportional hazards for age in the discharge model and hem
 
 The plot below shows the estimated effect of age over time on discharge. There is a stronger protective effect of age in the first few weeks (negative beta), with a weaker protective effect thereafter. We can account for this by splitting the effect of age into and early and late effect (making it time-dependent). 
 
-The plots for the non-proportional effects of hemorrhagic stroke (not shown) indicate influential observations which we address below.
-
 ```{r}
-figure_nums(name="cox_zph_age", "Plot of the estimated effect of age on dischage over time in ICU. The green line is the estimated effect with dotted lines for a 95% confidence interval. The horizontal red line indicates no effect of age.")
+figure_nums(name="cox_zph_age", "Plot of the estimated effect of age on discharge over time in ICU. The green line is the estimated effect with dotted lines for a 95% confidence interval. The horizontal red line indicates no effect of age.")
+par(mai=c(1,1,0.1,0.1))
 plot(prop_disch[2], xlab='Days since ICU admission', se=TRUE, col=3, resid=FALSE)
 abline(0, 0, col=2)
 ```
 
+The plot below shows the estimated effect of age over time on death. There is a large change in the effect of age, which grows over time from an effect close to zero on admission to ICU. The effect of age stabilises after around 9 days. After this time age consistently increases the risk of death.
+
+```{r}
+figure_nums(name="cox_zph_age_death", "Plot of the estimated effect of age on death over time in ICU. The green line is the estimated effect with dotted lines for a 95% confidence interval. The horizontal red line indicates no effect of age.")
+par(mai=c(1,1,0.1,0.1))
+plot(prop_death[2], xlab='Days since ICU admission', se=TRUE, col=3, resid=FALSE)
+abline(0, 0, col=2)
+```
+
+The plots for the non-proportional effects of hemorrhagic stroke (not shown) indicate influential observations which we address below.
+
+
 #### Discharge model with time-dependent effect of age
 
+Here we fit a Cox survival model for discharge with a separate effect of age before and after 20 days in ICU. 
 
 ```{r}
 # see: vignette("timedep", package = "survival")
-my.data = select(my.data, -stroke_type) %>%
-  filter(sex != 'Not specified')
+for_split = select(my.data, -stroke_type) %>%
+  mutate(sex = as.numeric(sex=='Male'),
+             age = (age-50)/10, # scaled
+             bmi = (bmi-30)/5)
 # add split to data at 20 days
-my.data2 <- survSplit(Surv(time=entry, time2=exit, event=to==5) ~ ., data= my.data, cut=c(20), episode= "tgroup", id="idx")
-m = coxph(Surv(time=entry, time2=exit, event) ~ sex + age:strata(tgroup) + bmi, data=my.data2)
-summary(m)
+for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to==5) ~ ., data= for_split, cut=c(20), episode= "tgroup", id="idx")
+split_m = coxph(Surv(time=entry, time2=exit, event) ~ sex + age:strata(tgroup) + bmi + factor(from), data=for_split_split)
+ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep=''),
+      term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=1'), 'Age (+10 years) before 20 days in ICU', term),
+      term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=2'), 'Age (+10 years) after 20 days in ICU', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, unknown', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '3'), 'Stroke, ischemic', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '4'), 'Stroke, hemorrhage', term),
+      term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
+      term = ifelse(term=='sex', 'Male', term)) %>%
+    select(term, estimate, CI) %>%
+    rename('HR' = 'estimate',
+           'CI' = 'CI')
+ftab = flextable(ests_disch_split) %>%
+  theme_box()%>%
+  autofit()
+ftab
 ```
+
+
+
+The stronger protective effect of age at early times is shown by the hazard ratio being well below one in early days, and then much closer to one for after 20 days.
+
+#### Death model with time-dependent effect of age
+
+Here we fit a Cox survival model for death with a separate effect of age before and after 9 days in ICU. 
+
+```{r}
+# see: vignette("timedep", package = "survival")
+for_split = select(my.data, -stroke_type) %>%
+  mutate(sex = as.numeric(sex=='Male'),
+             age = (age-50)/10, # scaled
+             bmi = (bmi-30)/5)
+# add split to data at 20 days
+for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to==6) ~ ., data= for_split, cut=c(9), episode= "tgroup", id="idx")
+split_m = coxph(Surv(time=entry, time2=exit, event) ~ sex + age:strata(tgroup) + bmi + factor(from), data=for_split_split)
+ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep=''),
+      term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=1'), 'Age (+10 years) before 9 days in ICU', term),
+      term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=2'), 'Age (+10 years) after 9 days in ICU', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, unknown', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '3'), 'Stroke, ischemic', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '4'), 'Stroke, hemorrhage', term),
+      term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
+      term = ifelse(term=='sex', 'Male', term)) %>%
+    select(term, estimate, CI) %>%
+    rename('HR' = 'estimate',
+           'CI' = 'CI')
+ftab = flextable(ests_disch_split) %>%
+  theme_box()%>%
+  autofit()
+ftab
+```
+
+The stronger effect of age at later times is clear in the increasing hazard ratio for death.
+
+Accounting for the non-proportional effect of age had little effect on the estimates for stroke, and hemorrhagic stroke was still strongly associated with an increased risk of death.
 
 #### Checking for influential patients
 
@@ -1033,6 +1111,15 @@ figure_nums(name="inf_discharge", "Influential observations for the Cox survival
 # test of influential observations
 influence_discharge = ggcoxdiagnostics(fit=cox_models$discharge_model, sline=FALSE, type = 'dfbeta', linear.predictions = FALSE, ggtheme = theme_bw())
 influence_discharge
+```
+
+The influential results for stroke are likely the few patients who had a stroke.
+
+```{r}
+figure_nums(name="inf_death", "Influential observations for the Cox survival model of death", level=2) # title
+# test of influential observations
+influence_death = ggcoxdiagnostics(fit=cox_models$death_model, sline=FALSE, type = 'dfbeta', linear.predictions = FALSE, ggtheme = theme_bw())
+influence_death
 ```
 
 

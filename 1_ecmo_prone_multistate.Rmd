@@ -1557,7 +1557,7 @@ There is one influential patient for prone for the model examining discharge. Th
 # look at influential observation(s)
 index = filter(influence_discharge$data, covariate=='prone', abs(res) >= 0.6) %>% pull(xval)
 to_table = cox_models$discharge_data[index,] %>%
-  select(id, site, sex, age, bmi, prone, days, cens) %>%
+  select(site, sex, age, bmi, prone, days, cens) %>%
   mutate(
     cens = ifelse(cens==0, 'No', 'Yes'), # nicer labels for table
     prone = ifelse(prone==0, 'No', 'Yes'),
@@ -1586,7 +1586,7 @@ There are some influential patients for prone for the model examining deaths, al
 # look at influential observation(s)
 index = filter(influence_death$data, covariate=='prone', abs(res) >= 0.1) %>% pull(xval)
 to_table = cox_models$death_data[index,] %>%
-  select(id, site, sex, age, bmi, prone, days, cens) %>%
+  select(site, sex, age, bmi, prone, days, cens) %>%
   mutate(
     cens = ifelse(cens==0, 'No', 'Yes'), # nicer labels for table
     prone = ifelse(prone==0, 'No', 'Yes'),
