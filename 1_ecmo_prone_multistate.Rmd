@@ -53,7 +53,8 @@ censor_day = 90
 # State 4: Death
 
 ## prepare CCC set (with id, from, to, entry, exit; from and to are state numbers)
-load('data/COVID_Data_stroke_Oct_31.RData') # 0_read_data.R
+#load('data/COVID_Data_stroke.RData') # 0_read_data.R
+load('data/COVID_Data_stroke_Oct_31.RData') # database freez
 #load('data/COVID_Data_stroke_dummy.RData') # 0_read_data.R - dummy data for testing code
 ## apply inclusions
 patients = filter(patients,
@@ -100,7 +101,11 @@ for_join = select(patients, pin, date_ecmo, any_prone) %>%
   #  mutate(date_ecmo = date_ecmo + 1) %>% # use first full date on ECMO? ...
   rename('date_daily' = 'date_ecmo') # ... currently matched on date of ECMO
 daily_ecmo = left_join(for_join, daily, by=c('pin','date_daily'))
+
+## for checking
+# check = select(patients, pin, date_icu, date_death, date_hospital_discharge, last_date, date_outcome, outcome) %>% filter(!is.na(date_icu), is.na(date_death), is.na(date_hospital_discharge), is.na(date_outcome))
 ```
+
 
 ```{r, include=FALSE}
 ### prepare data for survival analysis ###
@@ -112,9 +117,63 @@ my.data = time_transitions(indata=patients,
                            discharge_date = 'date_hospital_discharge',
                            censor_day = censor_day, check=TRUE) %>% # from 99_functions.R
   select(pin, from, to, start, end, date_ecmo, age, any_prone, sex, bmi, site_name, country, ecmo_prone_before) %>%
-  rename(id = pin, # rename to suit Martin's use
-         entry = start,
-         exit = end)
+  rename('entry' = 'start',
+         'exit' = 'end')
+
+# alternative function to verify, dummy function, do not run
+alternative = function(){
+  library(tidyr)
+my.data.alt = time_transitions_string(indata=patients,
+                intermediate_prior_ongoing= TRUE,
+                censor_day = censor_day,
+                start_state = 'date_ecmo',
+                int_state = 'prone_start',
+                int_state_end = 'prone_end',
+                discharge_date = 'date_hospital_discharge',
+                dates= c('date_ecmo', 'prone_start', 'prone_end', 'date_hospital_discharge', 'date_transfer','date_death'))
+## remove some transitions
+# no outcomes after transfer
+index = my.data.alt$from == 'date_transfer' 
+my.data.alt = my.data.alt[!index,]
+# 
+index = my.data.alt$from == 'date_ecmo' & my.data.alt$to=='date_int_state_start'& my.data.alt$entry==0&my.data.alt$exit==0.5
+my.data.alt = my.data.alt[!index,]
+#
+index = my.data.alt$from == 'date_int_state_start' & my.data.alt$to=='date_int_state_end'& my.data.alt$entry==0&my.data.alt$exit==0.5
+my.data.alt = my.data.alt[!index,]
+# rename states
+my.data.alt = rename(my.data.alt,
+                     'from_c' = 'from',
+                     'to_c' = 'to') %>%
+  mutate(to = case_when(
+    to_c == 'censored' ~ 0, # censored
+    to_c == 'date_transfer' ~ 0, # censored
+    to_c == 'last_date' ~ 0, # censored
+    to_c == 'date_int_state_end' ~ 1,
+    to_c == 'date_int_state_start' ~ 2,
+    to_c == 'discharge_date' ~ 3,
+    to_c == 'discharge' ~ 3,
+    to_c == 'date_death' ~ 4,
+    to_c == 'death' ~ 4
+  ),
+  from = case_when(
+    from_c == 'date_ecmo' & to_c=='date_int_state_end' ~ 2,
+    from_c == 'date_ecmo' & to_c!='date_int_state_end' ~ 1,
+    from_c == 'date_int_state_start' ~ 2,
+    from_c == 'date_int_state_end' ~ 1,
+  ))
+# compare and check
+with(my.data.alt, table(from_c, to_c))
+with(my.data.alt, table(from, to))
+#with(my.data, table(from, to))
+#f1 = filter(my.data.alt, from==2, to==4) %>% select(pin, from_c, to_c, entry, exit)
+#f2 = filter(my.data, from==2, to==4) %>% select(id, from, to, entry, exit)
+#f1$pin[f1$pin %in% f2$id == FALSE]
+#f2$id[f2$id%in%f1$pin  == FALSE]
+#f3 = filter(patients, pin=='OX_00549-0048') %>% select(pin, 'date_ecmo', 'prone_start', 'prone_end', 'date_hospital_discharge', 'date_death')
+#f4 = filter(my.data.alt, pin=='OX_00549-0048') %>% select(pin, from_c, to_c, from, to, entry, exit)
+#f5 = filter(my.data, id=='OX_00549-0048') %>% select(id, from, to, entry, exit)
+} # end of if
 
 # Set transition matrix for mstate
 tra <- transMat(x = list(c(2,3,4), c(1,3,4), c(),c()),
@@ -139,8 +198,10 @@ my.data$status <- 1
 my.data$status[my.data$to == 0] <- 0
 # Rename 'to' == 0  to 'cens' for use in 'ext_mstate' function
 my.data$to[my.data$to == 0] <- 'cens'
+my.data$from = as.character(my.data$from) # needed for function below
+#my.data$id = my.data$pin #needed for function below
 # Create data frame with all possible transitions for when a patient is at risk
-my.data_ext <- ext_mstate(my.data, tra)
+my.data_ext <- ext_mstate(my.data, tra, id.var='pin')
 # output for check
 save(my.data, file='data/ecmo_transitions.RData') # for 99_censored_ecmo.R
 ```
@@ -431,8 +492,8 @@ for_prone = filter(my.data,
                    from==1 | (from==2 & entry==0)) %>% # only transitions from not-prone or prone at time zero
   mutate(exit = ifelse(from==2, 0, exit), # reset time to zero for those in prone at entry
          to = ifelse(from==2, 2, to)) %>% # switch those at time zero to prone
-  group_by(id) %>%
-  arrange(id, entry) %>%
+  group_by(pin) %>%
+  arrange(pin, entry) %>%
   slice(1) %>% # just first transition (not interested in later transitions)
   ungroup()
 
@@ -609,10 +670,11 @@ class(my.data_ext) <- c("msdata", "data.frame")
 tmat <- attr(my.data_ext, "trans")
 # bootstrap performed with msboot function in mstate, 1000 samples
 set.seed(1906)
-B = 2000 # Should be 5000 for final run
+B = 200 # Should be 5000 for final run
+my.data_ext$id = as.numeric(as.factor(my.data_ext$pin)) # needed for function
 Example2_boot <- msboot(theta = LOS_boot, censor_day=censor_day, data=my.data_ext, id="id", B = B) # 
 
-# Confidence Intervals shown in Table 3
+# Confidence Intervals
 confidence_intervals = reshape2::melt(Example2_boot) %>%
   filter(!is.na(value)) %>%
   group_by(Var1) %>%
@@ -697,23 +759,21 @@ The days in parentheses are 95% confidence intervals based on `r B` bootstrap re
 ```{r}
 figure_nums(name="state_plot", "Plot of predicted probabilities for the four states") # increase level
 plot_it = function(){
-  par(mai=c(0.9,0.9,0.1,0.1), las=1)
-  plot(pt_fc_2, from = 1,  ord = c(4,2,1,3), type= "filled",cols = c("khaki1","indianred1","cornflowerblue","gray"),
+  par(mai=c(0.9,0.9,0.5,0.1), las=1) # b, l, t, r; leave room at top for legend
+  colours = c("khaki1","indianred1","cornflowerblue","gray")
+  plot(pt_fc_2, from = 1,  ord = c(4,2,1,3), type= "filled", cols = colours,
        lwd= 2, xlab = "Days since ECMO started", ylab = "Predicted Probabilities", 
-       cex.lab = 1.25, legend = c("", "", "", ""),
+       cex.lab = 1.25, legend = rep("", 4),
        main= NULL, axes=FALSE)
-  text(0, 0.62, "ECMO &\nsupine", cex = 1, adj=c(-0.1,0.5))
-  text(0.01, 0.14, "ECMO &\nprone", cex = 1, adj=c(-0.1,0.5))
-  text(censor_day, 0.9, "Discharge", cex = 1, adj=c(1.1,0.5))
-  text(censor_day, 0.15, "Death", cex = 1, adj=c(1.1,0.5)) 
   # better x-axis ticks:
   axis(side=2, at=seq(0,1,0.2), labels=TRUE) # y-axis
-  # 28 days
-  #axis(side=1, at=seq(0,28,2), labels=FALSE)
-  #axis(side=1, at=seq(0,28,7), labels=TRUE, tick=FALSE)
   # 90 days
   axis(side=1, at=seq(0,90,10), labels=FALSE)
   axis(side=1, at=seq(0,90,5), labels=TRUE, tick=FALSE)
+  # legend at top
+  par(xpd=TRUE)
+  labels = c('ECMO & supine','ECMO and prone','Discharge','Death')
+  legend(0, 1.2, labels, col=colours, border=NA, fill=colours, bty='n', ncol=2)
 }
 plot_it()
 jpeg(filename='figures/prone/patients_states_time.jpg', width=5, height=4, units='in', res=400, quality = 100)
@@ -747,20 +807,29 @@ g = ggcompetingrisks(cum_inc,
                  legend.title='',
                  risk.table = TRUE,
                  conf_int = TRUE)
-# output modified plot
-gmod = g + geom_line(size = 1.05) + # make lines thicker
+# create plot with better facet labels
+to_plot = mutate(g$data, 
+                 facet = paste('State moved from: ', group, sep=''))
+cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_line(size = 1.05) + # make lines thicker
+  facet_wrap(~facet)+
+  xlab('Days since ECMO started')+
+  ylab('Cumulative probability')+
+  theme_bw()+
   scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
   scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
   scale_colour_manual(name="State moved to:", values=c(4,2,3,1), labels=c("Supine","Prone","Discharge",'Death')) +  # change labels
   theme(
+    panel.grid.minor = element_blank(),
     panel.grid.major = element_line(colour=grey(0.8)),
     text = element_text(size=20), 
+    legend.position = 'top',
     legend.title = element_text(size=16),
     legend.text = element_text(size=16))
 figure_nums(name="cuminc_death", "Cumulative probabilities over time for the four states.")
-gmod
-jpeg('figures/prone/competing_risks_ecmo_prone.jpg', width=6.8, height=4.5, units='in', res=400, quality=100)
-print(gmod)
+cum_plot
+jpeg('figures/prone/competing_risks_ecmo_prone.jpg', width=7, height=4.5, units='in', res=400, quality=100)
+print(cum_plot)
 invisible(dev.off())
 ```
 
@@ -804,7 +873,7 @@ close(bugs)
 ## prepare the data for 'winbugs' or 'R', need to use clock reset method
 prepare_survival = function(indata, cens_events, clock_reset= TRUE, version='winbugs'){
 bugs_data = mutate(indata,
-    id_num = as.numeric(as.factor(id)), # make ID number for patients
+    id_num = as.numeric(as.factor(pin)), # make ID number for patients
     site_num = as.numeric(as.factor(site_name)), # make ID number for sites
     # clock reset
     exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
@@ -910,8 +979,8 @@ ftab
 # bayesian p-value for prone
 pval_prone = sum(bugs_results_death$sims.list$beta[,5]<0) / (length(bugs_results_death$sims.list$beta[,5]) + 1)
 # get number administratively censored
-censored = group_by(my.data, id) %>%
-  arrange(id, entry) %>%
+censored = group_by(my.data, pin) %>%
+  arrange(pin, entry) %>%
   slice(n()) %>% # last per patient
   filter(to == 'cens') # admin censored
 ```
@@ -1237,7 +1306,7 @@ ests = left_join(s, b, by='var') %>%
 
 There are `r n_diff` patients who move from prone to supine or vice versa, and there are `r nrow(daily_plot)` daily observations for these patients.
 
-The plot shows the individual results for patients (grey lines) before and after their move to prone. The red line is the estimated mean change from a regression model that has a change point in the slope over time on the day that patients switched to prone. The model also accounts for repeated data over time from the same patient using a random intercept.
+The plot shows the individual results for patients (grey lines) before and after their move to prone. The red line is the estimated mean change from a regression model that has a change point in the slope over time on the day that patients switched to prone. 
 
 For PEEP there was little change after moving to prone position, with a change in the slope per day of `r roundz(ests$Estimate,2)` with a 95% confidence interval from `r roundz(ests$lower,2)` to `r roundz(ests$upper,2)`.
 
@@ -1421,7 +1490,7 @@ The hazard of discharge increases greatly over time. The hazard of death also in
 ### Alternative Cox survival models
 
 Here we use non-parametric Cox models to confirm the results from the parametric Weibull survival models. These models use the multi-state approach, so patients could move from prone to supine (or vice versa) over time.
-These Cox models do not account for correlated results from the same patient, but they do account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
+These models account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
 
 The table shows the mean hazard ratios (HRs) and 95% confidence intervals for death and discharge.
 

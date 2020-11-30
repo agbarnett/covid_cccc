@@ -1,6 +1,6 @@
 # 99_functions.R
 # range of functions used by multiple programs 
-# October 2020
+# November 2020
 
 # function for rounding numbers with zeros kept
 roundz = function(x, digits){
@@ -367,7 +367,6 @@ sample_transitions = function(indata, in_from, in_to){
 }
 
 
-
 ### function to make transitions times with a general intermediate state
 time_transitions = function(indata, 
                             start_state = 'date_icu', # starting date/state
@@ -615,3 +614,164 @@ time_transitions = function(indata,
   return(for_model)
 } # end of function
 
+
+## function to make multi-state survival analysis given string of dates ##
+# data must have a bunch of dates, including `date_transfer` #
+time_transitions_string = function(indata, 
+                 intermediate_prior_ongoing = FALSE, # are intermediate events prior start date considered to be ongoing on start date (e.g., prone position); keep FALSE for acute events (e.g., stroke)
+                 dates,  # vector of dates
+                 int_state, # start of intermediate state
+                 int_state_end = NULL, # end of intermediate state (optional)
+                 start_state, # name of starting state
+                 discharge_date, # name of discharge (hospital or ICU)
+                 censor_day,
+                 check=FALSE){
+  
+  ## variable fixes
+  # simple rename for starting state
+  index = names(indata) == start_state
+  names(indata)[index] = 'date_start'
+  if(sum(index)==0){cat('Warning, check name start date\n')}
+  # simple rename for discharge
+  index = names(indata) == discharge_date
+  names(indata)[index] = 'discharge_date'
+  if(sum(index)==0){cat('Warning, check name discharge date\n')}
+  # and add old variable back for starting date
+  indata$temporary = indata$date_start
+  index = names(indata) == 'temporary'
+  names(indata)[index] = start_state
+  # simple renames for intermediate state start and end
+  index = names(indata) == int_state
+  names(indata)[index] = 'date_int_state_start'
+  if(sum(index)==0){cat('Warning, check name intermediate end date\n')}
+  if(is.null(int_state_end) == FALSE){
+    index = names(indata) == int_state_end
+    names(indata)[index] = 'date_int_state_end'
+    if(sum(index)==0){cat('Warning, check name intermediate end date\n')}
+  }
+  # update dates vector with generic discharge name
+  dates[dates==discharge_date] = 'discharge_date'
+  dates[dates==int_state] = 'date_int_state_start'
+  if(is.null(int_state_end) == FALSE){
+    dates[dates==int_state_end] = 'date_int_state_end'
+  }
+  
+  # exclude patients without start date
+  indata = filter(indata, !is.na(date_start))
+
+  ## fix dates
+  ## cannot tell what happened after transfers, so blank dates
+  # if transfer date before discharge then blank discharge
+  index = indata$date_transfer <= indata$discharge_date & !is.na(indata$discharge_date) & !is.na(indata$date_transfer)
+  indata$discharge_date[index] = NA
+  # if transfer date before death then blank death
+  index = indata$date_transfer <= indata$date_death & !is.na(indata$date_death) & !is.na(indata$date_transfer)
+  indata$date_death[index] = NA
+  # if transfer date before intermediate start
+  index = indata$date_transfer <= indata$date_int_state_start & !is.na(indata$date_int_state_start) & !is.na(indata$date_transfer)
+  indata$date_int_state_start[index] = NA
+  # if transfer date before intermediate end
+  if(is.null(int_state_end) == FALSE){
+    index = indata$date_transfer <= indata$date_int_state_end & !is.na(indata$date_int_state_end) & !is.na(indata$date_transfer)
+    indata$date_int_state_end[index] = NA
+  }
+  # transfer date also trumps last date
+  index = indata$date_transfer <= indata$last_date & !is.na(indata$last_date) & !is.na(indata$date_transfer)
+  indata$last_date[index] = NA
+  ##
+  # if death and discharge (ICU or hospital) on same day then blank discharge
+  index = indata$date_death == indata$discharge_date & !is.na(indata$date_death)
+  if(length(index)>0){indata$discharge_date[index] = NA}
+  # if last date before known dates then blank
+  for (d in dates){
+    # simple rename
+    i = names(indata) == d 
+    names(indata)[i] = 'date_check'
+    # blank
+    index = indata$date_check >= indata$last_date & !is.na(indata$last_date)
+    if(length(index)>0){indata$last_date[index] = NA}
+    # rename back
+    names(indata)[i] = d
+  }
+  # if intermediate state stopped is same as death or discharge then delete intermediate end date
+  if(is.null(int_state_end) == FALSE){
+    indata = mutate(indata,
+         date_int_state_end = ifelse(date_int_state_end == discharge_date & !is.na(discharge_date), NA, date_int_state_end),
+         date_int_state_end = ifelse(date_int_state_end == date_death & !is.na(date_death), NA, date_int_state_end),
+         date_int_state_end = as.Date(date_int_state_end, origin='1970-01-01'))
+  }
+  # move intermediate start date to overall start date if it is considered an ongoing event
+  if(intermediate_prior_ongoing == TRUE & is.null(int_state_end) == FALSE){
+    indata = mutate(indata,
+        date_int_state_start = ifelse(date_int_state_start < date_start & (date_int_state_end>date_start | is.na(date_int_state_end)) & !is.na(date_int_state_start)
+                                      , date_start, date_int_state_start),
+        date_int_state_start = as.Date(date_int_state_start, origin='1970-01-01'))
+  }
+
+  # arrange dates
+  first = select(indata, pin, date_start) # firs
+  dates_long = select(indata, pin, all_of(dates), 'last_date') %>%
+    gather(key='event', value='date', -`pin`) %>%
+    filter(!is.na(date)) %>% # remove any non events
+    left_join(first, by='pin') %>% # add start date
+    filter(date >= date_start) %>% # exclude any events prior to start date
+    arrange(pin, date) %>% # sort by date
+    mutate(time = as.numeric(date - date_start)) # get time difference
+  # now loop through patients to get one step ahead times
+  time_dep_data = NULL
+  for (u in unique(dates_long$pin)){
+    this_patient = filter(dates_long, pin == u)
+    n = nrow(this_patient)
+    #if(n == 1){cat(this_patient$pin, '\n')}
+    if(n > 1){ # only for patients with at least one transition
+      for (r in 1:(n-1)){
+        f = data.frame(pin = u, from=this_patient$event[r], to=this_patient$event[r+1], entry=this_patient$time[r], exit=this_patient$time[r+1])
+        time_dep_data = bind_rows(time_dep_data, f)
+      }
+    }
+  }
+  # edits to transitions:
+  time_dep_data = filter(time_dep_data, 
+          # remove impossible transitions from absorbing states
+          !from %in% c('discharge_date','last_date','date_death'),
+          # remove transitions after censor day
+          entry <= censor_day) 
+  # censor long times
+  index = time_dep_data$exit > censor_day
+  if(length(index)>0){
+    time_dep_data$exit[index] = censor_day # change time
+    time_dep_data$to[index] = 'last_date' # change state
+  }
+  # if non-intermediate to intermediate at time zero then assume intermediate on entry (so no transition)
+  index = with(time_dep_data, from %in% c(start_state,'date_int_state_start') & to %in% c('date_int_state_start','date_int_state_end') & entry == 0 & exit == 0)
+  if(length(index)>0){time_dep_data = time_dep_data[!index,]}
+  # if intermediate to non-intermediate at time zero then assume intermediate on entry (so no transition)
+  index = with(time_dep_data, from == 'date_int_state_end' & to == 'date_int_state_start' & entry == 0 & exit == 0)
+  if(length(index)>0){time_dep_data = time_dep_data[!index,]}
+  # add half day for transitions on the same day
+  index = time_dep_data$entry == time_dep_data$exit
+  time_dep_data$exit[index] = time_dep_data$exit[index] + 0.5
+  with(time_dep_data, table(from, to)) # check
+  
+  # randomly check 5 patients
+  if(check==TRUE){
+    s = sample(indata$pin, replace=FALSE, size=5)
+    d = dates[dates%in%start_state == FALSE] # drop start date, renamed
+    #
+    original = filter(indata, pin%in%s) %>% 
+      select(pin, 'date_start', all_of(d), 'last_date')
+    #
+    time_dep = filter(time_dep_data, pin%in%s)
+  }
+  #
+  #filter(patients, pin=='OX_724-0011') %>% select(contains('date_'), 'last_date')
+  
+  # add back patient information
+  time_dep_data = left_join(time_dep_data, indata, by='pin') %>%
+    mutate(to = ifelse(to=='date_death', 'death', to), # tidy up names
+           to = ifelse(to=='discharge_date', 'discharge', to),
+           to = ifelse(to=='last_date', 'censored', to)) # rename for censored
+  
+  return(time_dep_data)
+  
+} # end of function

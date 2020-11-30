@@ -12,19 +12,22 @@ knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, c
 options(width=1000) # Wide pages
 options(scipen=999) # avoid scientific presentation
 source('99_functions.R')
+source('99_functions_joint.R') # specifically for joint models
 library(dplyr)
 library(stringr)
 library(tidyr)
 library(broom)
 library(R2WinBUGS)
 bugs_location = "c:/Program Files/WinBUGS14" # location of the file WinBUGS14.exe
+library(mstate)
 library(cmprsk) # for competing risks
 library(survminer) # for nice plots of competing risks; also test of influential values
 library(flextable) # for nice tables
 library(captioner)
 table_nums <- captioner(prefix = "Table", levels=2, type = c("n", "c")) # number and character
 figure_nums <- captioner(prefix = "Figure", levels=2, type = c("n", "c"))
-#library(broom)
+source("Martin/ext_mstate.R")
+library(INLA) # for joint models
 
 # graphics things:
 library(diagram)
@@ -57,7 +60,7 @@ censor_day = 90 # maximum day for plots and estimates
 # a) patients
 # slim down variables:
 patients = select(patients, 'pin', 'site_name','country','age', 'sex', 'bmi','ethnicity', 'pregnant',
-                  'date_icu','date_ecmo','date_ecmo_discontinued',
+                  'date_icu','date_ecmo','date_ecmo_discontinued', 
                   'date_death','date_discharge','last_date','date_first_symptom',
                   'date_mech_vent_discontinued', 'date_mechanical_ventilation',
                   "height","weight",'date_admission','date_hospital_discharge',
@@ -67,8 +70,10 @@ patients = select(patients, 'pin', 'site_name','country','age', 'sex', 'bmi','et
                   'ecmo_return_cannula_insertion_site',
                   "ecmo_cardiac_arrest_before", "ecmo_worst_pa_o2_6hr_before",
                   "ecmo_worst_pa_co2_6hr_before", 'ecmo_continuous_rpt_before',
-                  starts_with("complication_"), 'stroke_during_treatment','stroke_type', 'stroke_group','outcome') %>%
-  mutate(pregnant = ifelse(pregnant==0, 'No', 'Yes')) # nicer label
+                  starts_with("complication_"), 'stroke_during_treatment','stroke_type', 'stroke_group', 'outcome','date_outcome','date_transfer') %>%
+  mutate(pregnant = ifelse(pregnant==0, 'No', 'Yes'), # nicer label
+         date_ecmo_discontinued = ifelse(is.na(date_ecmo), NA, date_ecmo_discontinued), # if no start date for ECMO, then remove any end date
+         date_ecmo_discontinued = as.Date(date_ecmo_discontinued, origin='1970-01-01'))
 ## inclusion
 patients = filter(patients,
     !country %in% c('Australia','United Kingdom')) # remove countries that did not collect stroke data
@@ -121,7 +126,7 @@ patients  = mutate(patients,
          any_ecmo = factor(any_ecmo, levels=0:1, labels=c('No','Yes')))
 
 # b) daily data
-daily = select(daily, pin, date_daily, ecmo, platelet_count, "aptt_aptr", "inr", alt_sgpt, "ast_sgot", 'bilirubin','blood_urea_nitrogen',
+daily = select(daily, pin, date_daily, ecmo, platelet_count, "p_h", "aptt", "inr", alt_sgpt, "ast_sgot", 'bilirubin','blood_urea_nitrogen',
                "lymphocyte_count", 'eotd_anticoagulants', "eotd_anticoagulants_type",
                "pa_o2", "pa_co2",
                "eotd_haemorrhagic_complication", "eotd_haemorrhagic_complication_source",
@@ -138,10 +143,6 @@ for_missing = select(patients, -pin, -any_ecmo, -stroke_type) %>% # remove ID; a
     ethnicity = ifelse(ethnicity=='Missing', NA, ethnicity),
     outcome = ifelse(outcome %in% c('','unknown'), NA, outcome)) %>% # tidy up missing outcome
   mutate_if(~is.character(.x), ~ifelse(.x=='', NA, .x)) # change '' to missing for character variables
-
-# split by ischemic and hemorrhagic separately. Ischemic - ischemic stroke and hypoxic ischemic. Hemorrhagic- sah Iph SDH - all hemarrhages. 
-patients = mutate(patients,
-)
 ```
 
 This report uses the data from `r data_date$month` `r data_date$day`. 
@@ -155,10 +156,10 @@ Patients were excluded for:
 
 ### Check of stroke numbers
 
-```{r}
+```{r, include=FALSE}
 # a) no stroke date
 f = filter(patients, complication_stroke=='Yes') %>%
-  select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge, date_hospital_discharge) 
+  select(pin, date_icu, complication_stroke_date, last_date, date_death, date_discharge, date_hospital_discharge, stroke_group) 
 n_start = nrow(f) # starting number
 n_missing_stroke_date = sum(is.na(f$complication_stroke_date)) # number excluded for missing stroke
 # b) stroke before ICU admission
@@ -168,18 +169,48 @@ n_update = nrow(f2)
 f2 = filter(f2, complication_stroke_date >= date_icu)
 n_stroke_prior_icu = n_update - nrow(f2) # number excluded
 # c) stroke after hospital discharge
-f3 = filter(f2, complication_stroke_date <= date_hospital_discharge | !is.na(date_hospital_discharge))
-n_stroke_post_icu = nrow(f2) - nrow(f3)
+f3 = mutate(f2, 
+            diff = as.numeric(complication_stroke_date - date_hospital_discharge)) %>%
+  filter(is.na(diff) | diff<=0)
+n_stroke_post_discharge = nrow(f2) - nrow(f3)
 n_final = nrow(f3)
+# find patients knocked out by `c`
+s = f2$pin[f2$pin %in% f3$pin==FALSE]
+filter(f, pin%in%s)
+
+## for patients without a stroke date, set them as 'None' for stroke type
+index = is.na(patients$complication_stroke_date)
+patients$complication_stroke[index] = 'No'
+patients$stroke_group[index] = 'None'
+#for (i in which(index==TRUE)){ # not working, but we do not use stroke_type here
+#  patients$stroke_type[[i]] = NULL
+#}
+## same for patients with stroke before admission
+index = patients$complication_stroke_date < patients$date_icu & !is.na(patients$complication_stroke_date) & !is.na(patients$date_icu)
+patients$complication_stroke[index] = 'No'
+patients$stroke_group[index] = 'None'
 ```
 
 We start with `r n_start` patients who had a stroke.
-Of these patients `r n_missing_stroke_date` have no stroke date, `r n_stroke_prior_icu` patients had their stroke prior to their ICU admission, and `r n_stroke_post_icu` patients had their stroke after their hospital discharge.
+Of these patients `r n_missing_stroke_date` have no stroke date, `r n_stroke_prior_icu` patients had their stroke prior to their ICU admission.
 This gives `r n_final` patients with a known stroke date during their hospital admission.
 
 # Descriptive statistics
 
-The tables below are split by the three types of stroke: Hemorrhage, Ischemic and Other/Unknown. There is also a columns for patients with no stroke.
+The tables below are split by the three types of stroke: Hemorrhage, Ischemic and Stroke, not specified. There is also a columns for patients with no stroke.
+
+```{r}
+ftype = group_by(patients, stroke_group) %>%
+  tally() %>%
+  arrange(n) %>%
+  mutate(percent = round(prop.table(n)*1000)/10,
+         stroke_group = ifelse(stroke_group=='Other/Unknown', 'Stroke, not specified', stroke_group)) # nicer label
+ftab = flextable(ftype) %>%
+  theme_box() %>%
+  autofit()
+table_nums(name="stroke_type","Stroke type, frequency table.", level=2) # title
+ftab
+```
 
 ```{r, continuous_table}
 #
@@ -188,7 +219,7 @@ ftab = desc_table_cont(
   vars = c('age','bmi','sofa','apache_ii'), 
   group_var = 'stroke_group', 
   var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
-  heading = c('Hemorrhage','Ischemic','Other/Unknown','None'),
+  heading = c('Hemorrhage','Ischemic','Stroke, not specified','None'),
   autofit = FALSE,
   include_total = FALSE) %>%
   fontsize(size=8) # smaller font to fit
@@ -214,7 +245,7 @@ ftab = desc_table_cat(indata = patients,
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
-                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) # see 99_functions.R
+                      heading = c('Hemorrhage','Ischemic','Stroke, not specified','None')) # see 99_functions.R
 table_nums(name="cat_table","Categorical variables.", level=2) # title
 ftab
 ```
@@ -226,7 +257,7 @@ ftab = desc_table_cat(indata = patients,
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
-                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None') )
+                      heading = c('Hemorrhage','Ischemic','Stroke, not specified','None') )
 table_nums(name="comorb_table","Comorbidities.", level=2) # title
 ftab
 ```
@@ -238,7 +269,7 @@ ptab = ftab = desc_table_cat(indata = to_tab,
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
-                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) 
+                      heading = c('Hemorrhage','Ischemic','Stroke, not specified','None')) 
 table_nums(name="preg_table","Pregnant (women only).", level=2) # title
 ptab
 ```
@@ -265,8 +296,8 @@ ftab = desc_table_cont(indata = patients,
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
-                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) %>% 
-   fontsize(part='all', size=8) %>% # smaller font size to fit
+                      heading = c('Hemorrhage','Ischemic','Stroke, not specified','None')) %>% 
+   fontsize(part='all', size=6) %>% # smaller font size to fit
   autofit()
 table_nums(name="time_table", "Time variables (in days)", level=2) # title
 ftab
@@ -278,16 +309,28 @@ ftab = desc_table_cat(indata = patients,
                       group_var = 'stroke_group', 
                       var_levels = c('Hemorrhage','Ischemic','Other/Unknown','None'),
                       include_total = FALSE,
-                      heading = c('Hemorrhage','Ischemic','Other/Unknown','None')) 
+                      heading = c('Hemorrhage','Ischemic','Stroke, not specified','None')) 
 table_nums(name="outcome_table", "Final outcome", level=2) # title
 ftab
 ```
-# Model diagram
-
-The figure below shows the four states in the multi-state survival model. Patients start at ICU admission.
 
 ```{r}
-states = c('ICU\nadmission','Stroke','Death','Hospital\ndischarge')
+patients = mutate(patients,
+        stroke_group_better = ifelse(stroke_group=='Other/Unknown', 'Stroke, not specified', stroke_group))
+bplot = ggplot(data=patients, aes(x=factor(stroke_group_better), y=age))+
+  geom_boxplot(fill=grey(0.9))+
+  xlab('Stroke type')+
+  ylab('Age, years')
+figure_nums(name="boxplot_age", 'Box plot of age by stroke type') # title
+bplot
+```
+
+# Model diagram
+
+The figure below shows the four states in the multi-state survival model. Patients start at ICU admission. Patients were censored if they were transferred to another hospital using the date of their transfer, or if they were still in hospital `r censor_day` after their ICU admission.
+
+```{r}
+states = c('ICU\nadmission','Stroke\n(3 types)','Death','Hospital\ndischarge')
 # Matrix of joins between states:
 M = matrix(data=c(
   2,1,
@@ -306,58 +349,65 @@ This table shows the transitions (movements) between the states (`r figure_nums(
 
 ```{r, include=FALSE}
 ### prepare data for survival analysis ###
-## ---- transitions
-my.data = time_transitions(
-  indata = patients, 
-  start_state = 'date_icu',
-  discharge_date = 'date_hospital_discharge', # hospital discharge
-  int_state = 'complication_stroke_date', # intermediate state
-  int_state_end = NULL, # no movement out of stroke
-  censor_day = censor_day, 
-  check = TRUE) %>% # from 99_functions.R
-  select(pin, from, to, start, end, date_icu, age, complication_stroke, stroke_type, stroke_group, sex, bmi, sofa, site_name, country) %>%
-  rename(id = pin, # rename to suit Martin's use
-         entry = start,
-         exit = end)
-
-# update to state to allow multiple stroke types
-my.data = mutate(my.data,
-                 # 
-                 from = ifelse(from==2 & stroke_group=='Ischemic', 3, from), # 2= other, 3=Ischemic, 4=Hemorrhage
-                 from = ifelse(from==2 & stroke_group=='Hemorrhage', 4, from),
-                 # first make room for extra states
-                 to = ifelse(to==4, 6, to), # move death
-                 to = ifelse(to==3, 5, to), # move discharge
-                 to = ifelse(to==2 & stroke_group=='Ischemic', 3, to), # 2= other, 3=Ischemic, 4=Hemorrhage
-                 to = ifelse(to==2 & stroke_group=='Hemorrhage', 4, to)
-                 )
+# create multi-state data
+my.data = time_transitions_string(indata=patients,
+                intermediate_prior_ongoing= FALSE,
+                censor_day = censor_day,
+                start_state = 'date_icu',
+                int_state = 'complication_stroke_date',
+                int_state_end = NULL,
+                discharge_date = 'date_hospital_discharge',
+                dates= c('date_icu', 'date_ecmo', "date_ecmo_discontinued", 'complication_stroke_date', 'date_transfer', 'date_death','date_hospital_discharge')) #
+# rename from and to states
+my.data = mutate(my.data, 
+                 to = ifelse(to=='date_transfer', 'censored', to),
+                 to = ifelse(to=='date_int_state_start', 'stroke', to),
+                 to = ifelse(to=='date_ecmo_discontinued', 'ecmo_end', to),
+                 from = ifelse(from=='date_ecmo', 'ecmo_start', from),
+                 from = ifelse(from=='date_int_state_start', 'stroke', from),
+                 from = ifelse(from=='date_icu', 'icu', from),
+                 from = ifelse(from=='date_ecmo_discontinued', 'ecmo_end', from),
+                 from = ifelse(from=='icu' & to=='ecmo_end', 'ecmo_start', from)) %>% # assume ECMO at ICU start
+  mutate(age_c = (age - 60)/10, # standardising
+         bmi_c = (bmi - 28)/5) 
+         
+# with(my.data, table(from, to))
+# specifically for stroke analysis
+my.data.stroke = filter(my.data, !from == 'stroke') %>% # not interested in events post-stroke
+  mutate(# update to state to allow multiple stroke types
+         from = ifelse(from=='stroke' & stroke_group=='Ischemic', 'stroke_i', from), # 2= other, 3=Ischemic, 4=Hemorrhage
+         from = ifelse(from=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', from),
+         to = ifelse(to=='stroke' & stroke_group=='Ischemic', 'stroke_i', to), # 2= other, 3=Ischemic, 4=Hemorrhage
+         to = ifelse(to=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', to)
+         )
 
 # check of stroke patients
-index = my.data$id %in% f3$pin # patients with a stroke
-my.data.stroke = my.data[index,]
+#index = my.data$id %in% f3$pin # patients with a stroke
+#my.data.stroke = my.data[index,]
 #
-not.there = f2$pin[f2$pin%in% my.data$id ==FALSE] # stroke patients not in the transition data
-check = filter(patients, pin%in% not.there) %>%
-    select(pin, date_icu, complication_stroke_date, last_date, date_death, date_hospital_discharge) 
+#not.there = f2$pin[f2$pin%in% my.data$id ==FALSE] # stroke patients not in the transition data
+#check = filter(patients, pin%in% not.there) %>%
+#    select(pin, date_icu, complication_stroke_date, last_date, date_death, date_hospital_discharge) 
 ```
 
 ```{r}
-tab = as.data.frame(with(my.data, table(from, to))) %>%
+columns = c('from', 'censored','date_ecmo','ecmo_end','stroke','stroke_i','stroke_h','discharge','death') # to get right order
+tab = as.data.frame(with(my.data.stroke, table(from, to))) %>%
   mutate(from = case_when(
-    from==1 ~ 'ICU admission', 
-    from==2 ~ 'Stroke: Other/Unknown',
-    from==3 ~ 'Stroke: Ischemic',
-    from==4 ~ 'Stroke: Hemorrhage')
+    from=='icu' ~ 'ICU admission', 
+    from=='ecmo_start' ~ 'During ECMO', 
+    from=='ecmo_end' ~ 'Post-ECMO')
   ) %>%
-  tidyr::spread(to, Freq)
+  tidyr::spread(to, Freq) %>%
+  select(columns)
 # table header
 table_header <- data.frame(
-  col_keys = c('from', '0','2','3','4','5','6'),
-  h1 = c('', rep("State moved to", 6)),
-  h2 = c(' ', '','Stroke','Stroke','Stroke','',''),
-  h3 = c('State moved from', 'Censored','Other/Unknown','Ischemic','Hemorrhage','Discharge','Death'),
+  col_keys = columns,
+  h1 = c('', rep("State moved to", 8)),
+  h2 = c(' ', '','ECMO','ECMO','Stroke','Stroke','Stroke','',''),
+  h3 = c('State moved from', 'Censored','Start', 'End','Stroke, not specified','Ischemic','Hemorrhage','Discharge','Death'),
   stringsAsFactors = FALSE )
-
+#
 ftab = flextable(tab) %>%
  set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
  merge_h(i=1, part = "header") %>% # merge "To" column headers
@@ -378,11 +428,9 @@ Weibull and exponential models did not converge, likely due to the relatively sm
 ```{r}
 median_sofa = median(patients$sofa, na.rm=TRUE) # threshold for high/low SOFA
 for_stroke = 
-  filter(my.data, !from %in% c(2,3,4), # not transitions after stroke for this analysis
+  filter(my.data.stroke, 
          sex != 'Not specified') %>% # remove small number missing
-  mutate(age = (age - 60)/10, # standardising
-         bmi = (bmi - 28)/5, # standardising
-         #age2 = age*age, # quadratic
+  mutate(#age2 = age_c*age_c, # quadratic
          # make variables with missing to avoid losing patients with partially complete data
          #bmi_c = case_when( # categorise BMI
         #   bmi <= 28 ~ 'Low',
@@ -400,14 +448,19 @@ for_stroke =
 control = coxph.control()
 control$iter.max = 100 # increase iterations
 # loop through outcomes
+outcomes_list = list()
+outcomes_list[[1]] = c('stroke','stroke_h','stroke_i') # all strokes combined
+outcomes_list[[2]] = 'stroke_h'
+outcomes_list[[3]] = 'stroke_i'
 hr_table = events = NULL
-for (s_type in c('2','3','4')){ # loop through stroke types
+for (s_type in outcomes_list){ # loop through stroke types
   # + factor(sofa_c) # does not converge, ditto for + bmi_c (BMI has around 10% missing)
-cmodel = coxph(Surv(time=exit, event= to==s_type, type='right') ~ age + sex + cluster(site_name), data=for_stroke, control = control)
+  for_stroke = mutate(for_stroke, event = as.numeric(to %in% s_type)) # make event depending on stroke type
+cmodel = coxph(Surv(time=exit, event= event, type='right') ~ age_c + sex + sofa_c + cluster(site_name), data=for_stroke, control = control)
 digits = 2
 ests = tidy(cmodel, conf.int = TRUE, exponentiate = TRUE) %>%
     mutate(
-      stroke_type = s_type,
+      stroke_type = paste(s_type,collapse = ','),
       HR = roundz(estimate, digits),
       conf.low = roundz(conf.low, digits),
       conf.high = roundz(conf.high, digits),
@@ -418,12 +471,12 @@ events = c(events, cmodel$nevent)
 }
 hr_table = mutate(hr_table,
                   stroke_type = case_when(
-                    stroke_type == '2' ~ 'Other/Unknown',
-                    stroke_type == '3' ~ 'Ischemic',
-                    stroke_type == '4' ~ 'Hemorrhage'
+                    stroke_type == 'stroke,stroke_h,stroke_i' ~ 'All strokes combined',
+                    stroke_type == 'stroke_i' ~ 'Ischemic',
+                    stroke_type == 'stroke_h' ~ 'Hemorrhage'
                   ),
-                  term = ifelse(term=='age', 'Age (+10 years)', term),
-                  term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
+                  term = ifelse(term=='age_c', 'Age (+10 years)', term),
+                  term = ifelse(term=='bmi_c', 'BMI (+5 kg/m2)', term),
                   term = ifelse(term=='sexMale', 'Male', term)) %>%
   select(stroke_type, term, HR, CI) %>%
   rename('Variable' = 'term',
@@ -432,26 +485,28 @@ ftab = flextable(hr_table) %>%
   merge_v(j=1) %>%
   theme_box() %>%
   autofit() 
+table_nums(name="hazard_table", "Hazard ratios and 95% confidence intervals for time to stroke", level=1) # title
 ftab
 ```
 
-The table shows the hazard ratios and 95% confidence intervals for the three types of stroke. I used two predictors of age and sex which are almost 100% complete. I added SOFA score but the models did not converge.
+The table shows the hazard ratios and 95% confidence intervals for the three types of stroke. I used two predictors of age and sex which are almost 100% complete. 
+
+SOFA score has been added as a simple three category variable of missing, low or high, with low or high determined using the median of `r median_sofa`. I used this approach because of the large amount of missing data for SOFA. The reference category is low.
 
 The confidence intervals for the effects of age and sex are relatively wide for some estimates, which also is likely because of the small number of strokes.
 
-### Cumulative risk plot for stroke
+### Cumulative risk plot for time to stroke split by stroke type
 
-```{r, fig.width=9, fig.height=6}
+```{r, fig.width=9, fig.height=5.5}
 # for nice labels
-my.data = mutate(my.data, from.nice=case_when(
-  from==1 ~ 'ICU', # cannot be any spaces
-  from==2 ~ 'Other/Unknown',
-  from==3 ~ 'Ischemic',
-  from==4 ~ 'Hemorrhage'
+my.data.stroke = mutate(my.data.stroke, from.nice=case_when(
+  from=='icu' ~ 'ICU', # cannot be any spaces
+  from=='ecmo_start' ~ 'ECMO_start', # cannot be any spaces
+  from=='ecmo_end' ~ 'ECMO_end' # cannot be any spaces
   ))
 # cumulative incidence
-cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from.nice, cencode=0))
-# remove lines not needed (stroke to stroke)
+cum_inc = with(my.data.stroke, cuminc(ftime=exit, fstatus=to, group=from.nice, cencode='censored'))
+# remove lines not needed (e.g., stroke to stroke)
 any_ests = NULL
 for (z in 1:(length(cum_inc)-1)){
   empty = any(cum_inc[[z]]$est !=0) # find missing
@@ -472,27 +527,113 @@ g = ggcompetingrisks(cum_inc,
                  legend.title='',
                  risk.table = TRUE,
                  conf_int = TRUE)
-# output modified plot
-gmod = g + geom_line(size = 1.05) + # make lines thicker
+# create plot with better facet labels
+to_plot = mutate(g$data, 
+                 facet = paste('State moved from: ', group, sep=''))
+cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_line(size = 1.05) + # make lines thicker
+  facet_wrap(~facet)+
+  xlab('Days since ICU admission')+
+  ylab('Cumulative probability')+
+  theme_bw()+
   scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
   scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
-  # states are = 2,3,4,5,6
-  scale_colour_manual(name="State moved to:", values=c(6,5,2,3,1), labels=c("Other/Unknown","Ischemic",'Hemorrhage',"Discharge",'Death')) +  # change labels
+  scale_colour_manual(name="State moved to:", values=cbPalette) +  # change labels?
   theme(
+    panel.grid.minor = element_blank(),
     panel.grid.major = element_line(colour=grey(0.8)),
-    text = element_text(size=20), 
+    text = element_text(size=14), 
+    legend.position = 'top',
     legend.title = element_text(size=14),
     legend.text = element_text(size=14))
-figure_nums(name="cuminc_death", "Cumulative probabilities over time for the four states.", level=1)
-gmod
-jpeg('figures/stroke/competing_risks.jpg', width=6.8, height=6, units='in', res=400, quality=100)
-print(gmod)
+figure_nums(name="cuminc_stroke", "Cumulative probabilities over time using each stroke type.", level=1)
+cum_plot
+jpeg('figures/stroke/competing_risks_stroke_separate.jpg', width=6.8, height=6, units='in', res=400, quality=100)
+print(cum_plot)
 invisible(dev.off())
 ```
 
 The panels of the plot are for the states of "ICU admission" and the three types of "stroke". The lines show where patients move to from these states.
 
 There is a clear higher risk of death and lower risk of discharge for patients with a hemorrhagic stroke.
+
+##### Alternative version of the above plot
+
+```{r, fig.width=8.5, fig.height=5.5}
+# alternative plot
+to_plot = mutate(g$data,
+                 event = ifelse(event=='date_ecmo', 'ECMO start', event),
+                 event = paste("State moved to:", event))
+alt_plot = ggplot(data= to_plot, aes(x=time, y=est, col=factor(group)))+
+  geom_line(size=1.05)+
+  xlab('Days since ICU')+
+  ylab('Cumulative probability')+
+scale_color_manual('State moved from:', values=(c("#CD950C", "#66CD00", "#FF00FF", "#ADD8E6")))+
+  facet_wrap(~event, scale='free_y')+
+  theme(legend.position = c(0.85,0.15),
+        text = element_text(size=14))
+figure_nums(name="cumunc_stroke_alternative", 'Cumulative probabilities over time of moving to ECMO, stroke (three types), discharge and death states') # title
+alt_plot
+#jpeg(filename='figures/stroke/cumulative_ecmo_stroke_alternative.jpg', width=5, height=4, units='in', res=400, quality = 100)
+#print(alt_plot)
+#invisible(dev.off())
+```
+
+This is an alternative arrangement of the previous plot. In this plot, the panels are the state moved to and the lines are coloured by the state moved from. Note the scales on the y-axes vary greatly by panel.
+
+The risks for death change greatly over time, with patients in ICU have an initially higher risk of death followed by a lower risk after around 30 days (compared with patients who have come off ECMO). There is a relatively higher risk of hemorrhagic stroke for those on ECMO compared with those in a standard bed.
+
+### Cumulative risk plot for stroke split for all strokes combined
+
+```{r, fig.width=9, fig.height=5.5}
+# cumulative incidence
+cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from, cencode='censored'))
+# remove lines not needed (e.g., stroke to stroke)
+any_ests = NULL
+for (z in 1:(length(cum_inc)-1)){
+  empty = any(cum_inc[[z]]$est !=0) # find missing
+  any_ests = c(any_ests, empty)
+}
+index = rev(which(any_ests == FALSE))
+for (z in index){
+  cum_inc[[z]] = NULL # blank lines
+}
+# plot
+g = ggcompetingrisks(cum_inc,
+                 xlab = 'Days since ICU admission',
+                 ylab = 'Cumulative probability',
+                 xlim = c(0, censor_day), # 
+                 title = '',
+#                 gsep = '_', # dummy to prevent groups being created from spaces
+                 cumcensor = TRUE, # does not work
+                 legend.title='',
+                 risk.table = TRUE,
+                 conf_int = TRUE)
+# create plot with better facet labels
+to_plot = mutate(g$data, 
+                 facet = paste('State moved from: ', group, sep=''))
+cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_line(size = 1.05) + # make lines thicker
+  facet_wrap(~facet)+
+  xlab('Days since ICU admission')+
+  ylab('Cumulative probability')+
+  theme_bw()+
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
+  scale_colour_manual(name="State moved to:", values=cbPalette) +  # change labels?
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(colour=grey(0.8)),
+    text = element_text(size=20), 
+    legend.position = 'top',
+    legend.title = element_text(size=16),
+    legend.text = element_text(size=16))
+figure_nums(name="cuminc_stroke_combined", "Cumulative probabilities over time for all strokes combined.")
+cum_plot
+jpeg('figures/stroke/competing_risks_stroke_combined.jpg', width=6.8, height=6, units='in', res=400, quality=100)
+print(cum_plot)
+invisible(dev.off())
+```
 
 ## Survival models
 
@@ -528,16 +669,18 @@ close(bugs)
 
 ```{r, include=FALSE}
 ## prepare the data for 'winbugs' or 'R', need to use clock reset method
-prepare_survival = function(indata, cens_events, clock_reset= TRUE, version='winbugs'){
+prepare_survival = function(indata, 
+                            events, # what are the events, e.g. 'death'
+                            clock_reset= TRUE, version='winbugs'){
   bugs_data = mutate(indata,
     site_num = as.numeric(as.factor(site_name)), # make site number
     # clock reset
     exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
     # add tiny time because time zero not allowed
-    days = ifelse(to %in% cens_events, NA, exit+0.001), # A right censored observation has a missing observed time ...
-    cens = ifelse(to %in% cens_events, exit+0.001, 0) # ... and a minimum time equal to the censored time
+    days = ifelse(to %in% events == FALSE, NA, exit+0.001), # A right censored observation has a missing observed time ...
+    cens = ifelse(to %in% events == FALSE, exit+0.001, 0) # ... and a minimum time equal to the censored time
                    )
-
+#
 if(version=='R'){
   return(bugs_data)
 }
@@ -551,25 +694,33 @@ bdata = list(N = N,
              site = bugs_data$site_num,
              days = bugs_data$days,
              cens = bugs_data$cens,
-             stroke_o = as.numeric(bugs_data$from==2),
-             stroke_i = as.numeric(bugs_data$from==3),
-             stroke_h = as.numeric(bugs_data$from==4),
+             stroke_o = as.numeric(bugs_data$from=='stroke'),
+             stroke_i = as.numeric(bugs_data$from=='stroke_i'),
+             stroke_h = as.numeric(bugs_data$from=='stroke_h'),
              sex = as.numeric(bugs_data$sex=='Male'),
-             age = (bugs_data$age-50)/10, # scaled
+             age = (bugs_data$age-60)/10, # scaled
              bmi = (bugs_data$bmi-30)/5) # scaled
   return(bdata)
 } # end of if
 } # end of function
-for_death = prepare_survival(indata=my.data, cens_events=c('2','3','4','5','0')) # admission, stroke, discharge or admin censored; event is death ('6')
-for_discharge = prepare_survival(indata=my.data, cens_events=c('2','3','4','6','0')) # admission, stroke, death or admin censored; event is discharge ('5')
+# add stroke types
+my.data.with.stroke.type = mutate(my.data, # update to state to allow multiple stroke types
+         from = ifelse(from=='stroke' & stroke_group=='Ischemic', 'stroke_i', from), # 
+         from = ifelse(from=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', from),
+         to = ifelse(to=='stroke' & stroke_group=='Ischemic', 'stroke_i', to), # 
+         to = ifelse(to=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', to)
+         )
+# create data
+for_death = prepare_survival(indata=my.data.with.stroke.type, events=c('death')) #  event is death 
+for_discharge = prepare_survival(indata=my.data.with.stroke.type, events=c('discharge')) # 
 ```
 
 ```{r, include=FALSE}
 ## run the survival models in WinBUGS
 # could remove individual effect, it is not helping much
 n.chains= 2
-MCMC = 10000 # increase to 10,000 for final run
-thin = 5 # increase to 5
+MCMC = 5000 # increase to 10,000 for final run
+thin = 3 # increase to 5
 debug = FALSE
 
 # initial values for single variable outcome (use mean for intercept)
@@ -621,7 +772,7 @@ A hazard ratio of 1 indicates no change in risk, whereas a hazard ratio above 1 
 ```{r}
 ## tabulate the results
 # get beta estimates
-beta_death = bugs_extract(inbugs=bugs_results_death, var='beta', exp=TRUE, names=c('Male','Age (+10 years)','BMI (+5 kg/m2)','Stroke - Other/unknown','Stroke - Ischemic','Stroke - Hemorrhage'), digits=2, make.ci=TRUE) # from 99_functions.R
+beta_death = bugs_extract(inbugs=bugs_results_death, var='beta', exp=TRUE, names=c('Male','Age (+10 years)','BMI (+5 kg/m2)','Stroke - not specified','Stroke - Ischemic','Stroke - Hemorrhage'), digits=2, make.ci=TRUE) # from 99_functions.R
 beta_discharge = bugs_extract(inbugs=bugs_results_discharge, var='beta', exp=TRUE, names=NULL, digits=2, make.ci=TRUE) # from 99_functions.R
 for_table = bind_cols(beta_death, beta_discharge) %>%
   select(-row, -Var) 
@@ -644,19 +795,16 @@ ftab = flextable(for_table) %>%
   autofit()
 table_nums(name="hr_weibull", "Hazard ratios and 95% credible intervals for death and discharge from the Weibull model", level=1)
 ftab
-## numbers used in text:
-# bayesian p-value for stroke
-pval_prone = sum(bugs_results_death$sims.list$beta[,1]<0) / (length(bugs_results_death$sims.list$beta[,1]) + 1)
 # get number administratively censored
-censored = group_by(my.data, id) %>%
-  arrange(id, entry) %>%
+censored = group_by(my.data, pin) %>%
+  arrange(pin, entry) %>%
   slice(n()) %>% # last per patient
   filter(to == '0') # admin censored
 ```
 
 Older age increases the hazard of death and decreases the hazard of discharge. 
 
-There is a very strong increase in the hazard of death for hemorrhagic stroke, and a strong increase for 'other/unknown' stroke. The uncertainty in the hazard ratios is relatively wide, which is due to the relatively small number of strokes.
+There is a very strong increase in the hazard of death for hemorrhagic stroke, and a strong increase for 'not specified' stroke. The uncertainty in the hazard ratios is relatively wide, which is due to the relatively small number of strokes.
 
 ## Cumulative survival models
 
@@ -666,24 +814,27 @@ The table below shows the cumulative hazard ratios and 95% confidence intervals 
 
 ```{r}
 my.data_crr = mutate(my.data, 
+   # update to state to allow multiple stroke types
+   from = ifelse(from=='stroke' & stroke_group=='Ischemic', 'stroke_i', from), 
+   from = ifelse(from=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', from),
+   to = ifelse(to=='stroke' & stroke_group=='Ischemic', 'stroke_i', to), 
+   to = ifelse(to=='stroke' & stroke_group=='Hemorrhage', 'stroke_h', to),
   # clock reset
   exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
   # prepare variables
-   stroke_other = as.numeric(from==2), # # 2= other, 3=Ischemic, 4=Hemorrhage
-   stroke_ischemic = as.numeric(from==3),
-   stroke_hemorrhage = as.numeric(from==4),
-   age = (age-50)/10, # scaled
-   bmi = (bmi-30)/5, # scaled
+   stroke_other = as.numeric(from=='stroke'), # # 2= other, 3=Ischemic, 4=Hemorrhage
+   stroke_ischemic = as.numeric(from=='stroke_i'),
+   stroke_hemorrhage = as.numeric(from=='stroke_h'),
    sex = as.numeric(sex=='Male'))
 # small amounts of missing
 my.data_crr = mutate(my.data_crr,
-          bmi = ifelse(is.na(bmi)==TRUE, 0, bmi)) # use mean
+          bmi_c = ifelse(is.na(bmi_c)==TRUE, 0, bmi_c)) # use mean
 #
-cov1 = as.matrix(select(my.data_crr, sex, age, bmi, stroke_other, stroke_ischemic, stroke_hemorrhage))
+cov1 = as.matrix(select(my.data_crr, sex, age_c, bmi_c, stroke_other, stroke_ischemic, stroke_hemorrhage))
 # death model (to = 6)
-cum_rr_death = with(my.data_crr, crr(ftime=exit, fstatus=to==6, cov1=cov1, cencode='0', maxiter = 100))
+cum_rr_death = with(my.data_crr, crr(ftime=exit, fstatus=to=='death', cov1=cov1, cencode='censored', maxiter = 100))
 # discharge model (to =5)
-cum_rr_discharge = with(my.data_crr, crr(ftime=exit, fstatus=to==5, cov1=cov1, cencode='0', maxiter = 100))
+cum_rr_discharge = with(my.data_crr, crr(ftime=exit, fstatus=to=='discharge', cov1=cov1, cencode='censored', maxiter = 100))
 s_death = summary(cum_rr_death) # cannot use broom
 s_discharge = summary(cum_rr_discharge) # cannot use broom
 table_death = as.data.frame(s_death$coef); names(table_death) = c('coef','exp_coef','SE','z','pval')
@@ -727,9 +878,13 @@ Hemorrhagic stroke were associated with a greatly increased probability of death
 ## Anticoagulation type at the time of stroke
 
 ```{r}
-set.seed(212121)
+# function to run case-control analysis depending on stroke type
+case_control = function(s_type, number_of_controls = 5){
+set.seed(212121) # for random control selection
 # split into cases and controls by stroke
-cases = filter(patients, !is.na(complication_stroke_date)) %>%
+cases = filter(patients, 
+               !is.na(complication_stroke_date), # has a stroke ...
+               stroke_group %in% s_type) %>% # ... of this type
   select(pin, age, complication_stroke_date, date_icu) %>%
   mutate(days = as.numeric(complication_stroke_date - date_icu)) %>%
   filter(!is.na(days),
@@ -742,7 +897,7 @@ cases = filter(patients, !is.na(complication_stroke_date)) %>%
     TRUE ~ days
   ))
 controls = filter(patients, 
-                  is.na(complication_stroke_date), # no stroke date
+                  !pin %in% unique(cases$pin), # not in the stroke case data
                   !is.na(date_icu)) %>% # with ICU data
   select(pin, age, date_icu)
 # merge cases with daily data
@@ -759,8 +914,7 @@ controls = left_join(controls, daily, by=c('pin'='pin')) %>%
     days > 50 ~ 55,
     TRUE ~ days
   ))
-# match controls to case
-number_of_controls = 5
+# match controls to case:
 matched = NULL
 for (k in 1:nrow(cases)){
   this_case = cases[k,] %>%
@@ -769,7 +923,7 @@ for (k in 1:nrow(cases)){
                            days_c == this_case$days_c, # same (grouped) day in ICU
                            age >= (this_case$age - 2), # age within 2 years
                            age <= (this_case$age + 2)) %>%
-    sample_n(number_of_controls) %>%
+    sample_n(number_of_controls) %>% # randomly sample
     mutate(case = 0)
   comb = bind_rows(this_case, random_controls) %>%
     mutate(pair = k)
@@ -802,15 +956,36 @@ ftab = flextable(table) %>%
  merge_h(i=1, part = "header") %>% # merge column headers
   theme_box() %>%
   autofit()
-table_nums(name="anti_table","Anticoagulants on the day of stroke compared with matched controls.", level=1)
-ftab
+# chi-squared test
+  tab = with(matched, table(case, eotd_anticoagulants))
+  chisq = chisq.test(tab, simulate.p.value = TRUE)
+# return
+  to_return = list()
+  to_return$chisq = chisq
+  to_return$table = ftab
+  to_return$matched = matched
+  return(to_return)
+} # end of function
+#
+cc_Hemorrhage = case_control(s_type = 'Hemorrhage')
+table_nums(name="anti_table_h","Anticoagulants on the day of hemorrhagic stroke compared with matched controls.", level=1)
+cc_Hemorrhage$table
 ```
 
-The table shows the anticoagulant use on the day of stroke. The controls without stroke were matched to the cases based on age (within 2 years) and days since ICU admission. We used five randomly selected controls per case. The cells are the number and percentage.
+The table shows the anticoagulant use on the day of hemorrhagic stroke. The controls without hemorrhagic stroke were matched to the cases based on age (within 2 years) and days since ICU admission. We used five randomly selected controls per case. The cells are the number and percentage.
+
+A chi-squared test on the above table gives X2=`r roundz(cc_Hemorrhage$chisq$statistic,1)` with p-value=`r format.pval(cc_Hemorrhage$chisq$p.value, digits=2, eps=0.001)`.
 
 ```{r}
 #
-matched = mutate(matched,
+cc_ischemic = case_control(s_type = 'Ischemic')
+table_nums(name="anti_table_i","Anticoagulants on the day of ischemic stroke compared with matched controls.")
+cc_ischemic$table
+```
+
+```{r}
+#
+matched = mutate(cc_Hemorrhage$matched,
                  eotd_anticoagulants_type = ifelse(is.na(eotd_anticoagulants_type), '', eotd_anticoagulants_type))
 table = group_by(matched, case, eotd_anticoagulants_type) %>%
   tally() %>%
@@ -834,11 +1009,593 @@ ftab = flextable(table) %>%
  merge_h(i=1, part = "header") %>% # merge column headers
   theme_box() %>%
   autofit()
-table_nums(name="anti_table_type","Anticoagulant type on the day of stroke compared with matched controls.") # title
+table_nums(name="anti_table_type_h","Anticoagulant type on the day of hemorrhagic stroke compared with matched controls.") # title
 ftab
 ```
 
-This table shows the type of anticoagulant on the day of stroke.
+This table shows the type of anticoagulant on the day of hemorrhagic stroke.
+
+```{r}
+#
+matched = mutate(cc_ischemic$matched,
+                 eotd_anticoagulants_type = ifelse(is.na(eotd_anticoagulants_type), '', eotd_anticoagulants_type))
+table = group_by(matched, case, eotd_anticoagulants_type) %>%
+  tally() %>%
+  group_by(case) %>%
+  mutate(percent = round(prop.table(n)*100),
+         cell = paste(n, ' (', percent, ')', sep='')) %>%
+  select(-n, -percent) %>%
+  ungroup() %>%
+  spread(case, cell) %>%
+  mutate(eotd_anticoagulants_type = ifelse(eotd_anticoagulants_type=='', 'Missing', eotd_anticoagulants_type))
+#
+# table header
+table_header <- data.frame(
+  col_keys = c('eotd_anticoagulants_type','0','1'),
+  h1 = c('', 'Stroke', 'Stroke'),
+  h2 = c('Anticoagulant type','No','Yes'),
+  stringsAsFactors = FALSE )
+#
+ftab = flextable(table) %>% 
+  set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+ merge_h(i=1, part = "header") %>% # merge column headers
+  theme_box() %>%
+  autofit()
+table_nums(name="anti_table_type_i","Anticoagulant type on the day of hemorrhagic stroke compared with matched controls.") # title
+ftab
+```
+
+### Platelet count on the day of stroke
+
+```{r}
+# combine two stroke types
+to_count = bind_rows(cc_Hemorrhage$matched, cc_ischemic$matched, .id='s_type') %>%
+  select(s_type, case, pair, platelet_count) %>%
+  mutate(s_type = ifelse(s_type==1, 'Hemorrhage', 'Ischemic'),
+         case = ifelse(case==1, 'Case', 'Control'))
+# make table
+table = group_by(to_count, s_type, case) %>%
+  summarise(N = n(), 
+            Missing = sum(is.na(platelet_count)), 
+            mean=mean(platelet_count, na.rm=TRUE),
+            sd=sd(platelet_count, na.rm=TRUE)) %>%
+  ungroup() %>%
+  mutate(N = N - Missing, # subtract missing
+         mean = round(mean*10)/10,
+         sd = round(sd*10)/10)
+ftab = flextable(table) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+The table shows the number non-missing, the number missing, and the mean and variance.
+
+```{r}
+bplot = ggplot(data=filter(to_count, !is.na(platelet_count)), aes(x=factor(case), y=platelet_count, fill=factor(case)))+
+  geom_boxplot()+
+  ylab('Platelet count')+
+  facet_wrap(~s_type)+
+  theme(legend.position = 'none')
+bplot
+```
+
+# Does ECMO increase the risk of stroke?
+
+As ECMO is a time-dependent exposure we need to use a multi-state model to examine this question.
+
+```{r, fig.height=6, fig.width=6}
+states = c('ICU\nnon-ECMO','ECMO','Post-ECMO','Stroke','Death','Hospital\ndischarge')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  3,2,
+  4,1,
+  4,2,
+  4,3,
+  5,1,
+  5,2,
+  5,3,
+  5,4,
+  6,4,
+  6,3,
+  6,2,
+  6,1
+), byrow = TRUE, ncol=2)
+figure_nums(name="model_diagram_ecmo", "The six states in the model and the possible movements between states", level=1) # title
+multistate_diagram(states=states, links = M, pos = c(3,1,2), arr.pos=0.65) # see 99_functions.R
+```
+
+
+### Table of transitions between states
+
+This table shows the transitions (movements) between the states (`r figure_nums("model_diagram_ecmo", display = "cite")`).
+
+```{r}
+states = c('from', 'date_ecmo','ecmo_end','stroke','discharge','death','censored') # columns in order
+tab = as.data.frame(with(my.data, table(from, to))) %>%
+  tidyr::spread(to, Freq) %>%
+  select(all_of(states))
+# table header
+table_header <- data.frame(
+  col_keys = states,
+  h1 = c('', rep("State moved to", 6)),
+  h2 = c('State moved from', 'ECMO start','ECMO end','Stroke','Discharge','Death','Censored'),
+  stringsAsFactors = FALSE )
+ftab = flextable(tab) %>%
+  set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>%
+  align(align='center', part='all') %>% # centre text
+  autofit() 
+table_nums(name="transitions_ecmo", "Transition numbers between states") # title
+ftab
+```
+
+## Movements between states over time
+
+```{r, fig.width=8, fig.height=6.5}
+# cumulative incidence
+cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from, cencode='censored'))
+# remove lines not needed (e.g., stroke to stroke)
+any_ests = NULL
+for (z in 1:(length(cum_inc)-1)){
+  empty = any(cum_inc[[z]]$est !=0) # find missing
+  any_ests = c(any_ests, empty)
+}
+index = rev(which(any_ests == FALSE))
+for (z in index){
+  cum_inc[[z]] = NULL # blank lines
+}
+# plot
+g = ggcompetingrisks(cum_inc,
+                     xlab = 'Days since ICU',
+                     ylab = 'Cumulative probability',
+                     xlim = c(0,censor_day), # 
+                     title = '',
+                     # gsep = '_', # dummy to prevent groups being created from spaces
+                     cumcensor = TRUE, # does not work
+                     legend.title='',
+                     risk.table = TRUE,
+                     conf_int = TRUE)
+# create plot with better facet labels
+to_plot = mutate(g$data, 
+                 facet = paste('State moved from: ', group, sep=''))
+cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_line(size = 1.05) + # make lines thicker
+  facet_wrap(~facet)+
+  xlab('Days since ICU')+
+  ylab('Cumulative probability')+
+  theme_bw()+
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_y_continuous(breaks=seq(0, 0.9, 0.1))+
+  scale_colour_manual(name="State moved to:", values=cbPalette) +  # change labels?
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(colour=grey(0.8)),
+    text = element_text(size=20), 
+    legend.position = 'top',
+    legend.title = element_text(size=16),
+    legend.text = element_text(size=16))
+figure_nums(name="cumunc_stroke_ecmo", 'Cumulative probabilities over time of moving to ECMO, stroke, discharge and death states') # title
+cum_plot
+jpeg(filename='figures/stroke/cumulative_ecmo_stroke.jpg', width=5, height=4, units='in', res=400, quality = 100)
+print(cum_plot)
+invisible(dev.off())
+```
+
+```{r, fig.width=8.5, fig.height=6.5}
+# 
+to_plot = mutate(g$data, event = paste('State moved to:', event))
+# alternative plot
+alt_plot = ggplot(data= to_plot, aes(x=time, y=est, col=factor(group)))+
+  geom_line(size=1.05)+
+  xlab('Days since ICU')+
+  ylab('Cumulative probability')+
+scale_color_manual('State moved from:', values=(c("#CD950C", "#66CD00", "#FF00FF", "#ADD8E6")))+
+  facet_wrap(~event, scale='free_y')+
+  theme(legend.position = c(0.85,0.15),
+        text = element_text(size=12))
+figure_nums(name="cumunc_stroke_ecmo_alternative", 'Cumulative probabilities over time of moving to ECMO, stroke, discharge and death states') # title
+alt_plot
+jpeg(filename='figures/stroke/cumulative_ecmo_stroke_alternative.jpg', width=5, height=4, units='in', res=400, quality = 100)
+print(alt_plot)
+invisible(dev.off())
+```
+
+This is an alternative arrangement of the previous plot. In this plot, the panels are the state moved to and the lines are coloured by the state moved from. Note the scales on the y-axes vary by panel.
+
+The higher risk of death post stroke and post-ECMO is clear in this figure (compared with patients remainin in the ICU state). Also clear is the lower risk of discharge.
+
+Most transitions to ECMO happen within the first 20 days.
+
+### Cox survival models of time to stroke
+
+
+```{r}
+for_stroke = mutate(my.data,
+                    from = relevel(factor(from), ref='icu')) %>%
+  filter(from!='stroke') # exclude stroke for this analysis
+#
+c_stroke = coxph(Surv(time=entry, time2=exit, event= to=='death') ~ I(sex=='Male') + age_c + from + cluster(site_name), data=for_stroke)
+digits = 2
+ests_stroke = tidy(c_stroke, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(!str_detect(string=term, pattern = 'fromstroke')) %>%
+    mutate(
+      term = case_when(
+        str_detect(term, 'Male') ==TRUE ~ 'Male',
+        str_detect(term, 'age')==TRUE ~ 'Age (+10 years)',
+        str_detect(term, 'fromecmo_start')==TRUE ~ 'During ECMO',
+        str_detect(term, 'fromecmo_end')==TRUE ~ 'Post-ECMO'
+      ),
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep='')) %>%
+    rename('HR' = 'estimate',
+           'CI' = 'CI') %>%
+  select('term','HR','CI')
+ftab = flextable(ests_stroke) %>%
+  theme_box() %>%
+  autofit()
+table_nums(name="cox_stroke_ecmo", 'Cox survival model of stroke with ECMO and post-ECMO as a time-dependent exposures') # title
+ftab
+```
+
+Being on ECMO dramatically reduces the hazard of stroke, but the risk of stroke is far higher for patients after they come off ECMO.
+The reference group for during ECMO and post-ECMO is patients in a standard ICU bed.
+
+### Cox survival models of times to death and discharge
+
+```{r}
+# reference category
+my.data = mutate(my.data, from = relevel(factor(from), ref='icu'))
+# death
+c_death = coxph(Surv(time=entry, time2=exit, event= to=='death') ~ I(sex=='Male') + age_c + from + cluster(site_name), data=my.data)
+# discharge
+c_discharge = coxph(Surv(time=entry, time2=exit, event= to=='discharge') ~ I(sex=='Male') + age_c + from + cluster(site_name), data=my.data)
+#
+ests_death = tidy(c_death, conf.int = TRUE, exponentiate = TRUE)
+ests_disch = tidy(c_discharge, conf.int = TRUE, exponentiate = TRUE) 
+ests_d = bind_rows(ests_death, ests_disch, .id='outcome') %>%
+    mutate(
+      outcome = ifelse(outcome==1, 'Death','Discharge'),
+      term = case_when(
+        str_detect(term, 'Male') ==TRUE ~ 'Male',
+        str_detect(term, 'age')==TRUE ~ 'Age (+10 years)',
+        str_detect(term, 'fromecmo_start')==TRUE ~ 'During ECMO',
+        str_detect(term, 'fromecmo_end')==TRUE ~ 'Post-ECMO',
+        str_detect(term, 'fromstroke')==TRUE ~ 'Stroke',
+        TRUE ~ as.character(term)
+      ),
+      estimate = roundz(estimate, digits),
+      conf.low = roundz(conf.low, digits),
+      conf.high = roundz(conf.high, digits),
+      CI = paste(conf.low, ' to ', conf.high, sep='')) %>%
+    rename('HR' = 'estimate',
+           'CI' = 'CI') %>%
+  select('outcome','term','HR','CI')
+ftab = flextable(ests_d) %>%
+  theme_box() %>%
+  autofit()
+table_nums(name="cox_stroke_ecmo_death", 'Cox survival models for death and discharge with stroke, ECMO and post-ECMO as time-dependent exposures') # title
+ftab
+```
+
+This table is for all stroke types combined.
+
+### Cumulative subdistribution hazard models of death and discharge
+
+```{r}
+# prepare data
+for_cum = mutate(my.data,
+                    exit_reset = exit - entry, # clock reset
+                    sexn = as.numeric(sex=='Male'),
+                    stroke = as.numeric(from=='stroke'),
+                    ecmo_start = as.numeric(from=='ecmo_start'),
+                    post_ecmo = as.numeric(from=='ecmo_end'))
+#
+cov1 = as.matrix(select(for_cum, sexn, age_c, stroke, ecmo_start, post_ecmo))
+col_names = c('Sex = male','Age (+10 years)','Stroke','During ECMO','Post-ECMO') # used later
+cum_rr_death = with(for_cum, crr(ftime=exit_reset, fstatus= to=='death', cov1=cov1, cencode='censored', maxiter = 100))
+cum_rr_discharge = with(for_cum, crr(ftime=exit_reset, fstatus= to=='discharge', cov1=cov1, cencode='censored', maxiter = 100))
+#
+s_death = summary(cum_rr_death) # cannot use broom
+s_discharge = summary(cum_rr_discharge) # cannot use broom
+table_death = as.data.frame(s_death$coef); names(table_death) = c('coef','exp_coef','SE','z','pval')
+table_discharge = as.data.frame(s_discharge$coef); names(table_discharge) = c('coef','exp_coef','SE','z','pval')
+tab = bind_rows(table_death, table_discharge, .id='type') # combine tables
+table = mutate(tab,
+               z = qnorm(0.975),
+               lower = coef - (z*SE), # make CIs
+               upper = coef + (z*SE),
+               HR = roundz(exp(coef), 2),
+               lower = roundz(exp(lower), 2),
+               upper = roundz(exp(upper), 2),
+               CI = paste(lower, ' to ', upper, sep='')) %>%
+  select(type, HR, CI) 
+ftable = bind_cols(filter(table, type==1) %>% select(-type),
+                   filter(table, type==2) %>% select(-type))
+names(ftable) = c('HR1','CI1','HR2','CI2')
+ftable = mutate(ftable, Variable=col_names) %>%
+  select('Variable', everything()) %>% # move Variable first
+  flextable() %>%
+  add_header('Variable'='', 'HR1' = 'Death', 'CI1' = 'Death', 'HR2' = 'Discharge', 'CI2' = 'Discharge') %>%
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit() 
+table_nums(name="crr_hazards_death", "Hazard ratios and 95% confidence intervals using a cumulative probability regression model for death and discharge")
+ftable
+```
+
+Older age increased the risk of death and decreased the risk of discharge.
+
+### Plot of patient probabilities over time
+
+```{r, include=FALSE}
+# Set transition matrix for mstate
+tra <- transMat(x = list(c(2,4,5,6), c(3,4,5,6), c(4,5,6), c(3,5,6),c(),c()),
+                names = c("icu","ecmo_start", "ecmo_end","stroke","discharge","death"))
+# collapse ecmo end to icu
+my.data.ext = mutate(my.data, 
+                 to = ifelse(to=='date_ecmo', 'ecmo_start', to))
+# transition must by numbers for ext_mstate
+rownames(tra) = colnames(tra) = 1:6
+my.data.ext = mutate(my.data.ext,
+                 to = case_when(
+  to=='censored' ~ 0,
+  to=='icu' ~ 1,
+  to=='ecmo_start' ~ 2,
+  to=='ecmo_end' ~ 3,
+  to=='stroke' ~ 4,
+  to=='discharge' ~ 5,
+  to=='death' ~ 6
+),
+from = case_when(
+  from=='icu' ~ 1,
+  from=='ecmo_start' ~ 2,
+  from=='ecmo_end' ~ 3,
+  from=='stroke' ~ 4,
+  from=='discharge' ~ 5,
+  from=='death' ~ 6
+))
+
+# Add transition vectors (not censored)
+my.data.ext$trans <- NA
+for (i in rownames(tra))
+{
+  for (j in rownames(tra))
+  {
+    my.data.ext$trans[which(my.data.ext$from == i & my.data.ext$to ==j)] <- tra[i, j]  
+  }
+}
+with(my.data.ext, table(from, to))
+
+# Add status vector, indicates observed transition
+my.data.ext$status <- 1
+# Status vector for censored observations set to '0'
+my.data.ext$status[my.data.ext$to == '0'] <- 0
+# Rename 'to' == 0  to 'cens' for use in 'ext_mstate' function
+my.data.ext$to[my.data.ext$to == '0'] <- 'cens'
+# Create data frame with all possible transitions for when a patient is at risk
+my.data_ext <- ext_mstate(my.data.ext, tra, id.var='pin')
+```
+
+```{r, death_probs}
+# get starting numbers
+starts = filter(my.data.ext, entry==0) %>% 
+  group_by(from) %>% 
+  summarise(n=n()) %>% 
+  ungroup() %>% 
+  mutate(p = prop.table(n))
+init_dis_2 <- c(starts$p, 0, 0) # to update (last two zeros are death and discharge)
+
+## Cox model stratified by transition
+c_2 <- coxph(Surv(entry, exit, status==1) ~ strata(trans), data= my.data_ext, method = "breslow")
+# msfit calculates baseline hazards
+msf_2 <- msfit(c_2, trans = tra)
+# probtrans calculates transition probabilities, prediction from day 0
+pt_2 <- probtrans(msf_2, predt = 0)
+
+# Create weighted average of transition probabilities for progress of entire cohort
+# Used to produce full cohort results in Table 3 
+pt_fc_2 <- pt_2
+fc_2 <- pt_fc_2[[1]] * starts$p[1] + pt_fc_2[[2]] * starts$p[2]
+pt_fc_2[[1]] <- fc_2
+```
+
+
+```{r, fig.width=8, fig.height=6}
+figure_nums(name="state_plot", "Plot of predicted probabilities for the six states") # title
+plot_it = function(){
+  par(mai=c(0.9,0.9,0.5,0.1), las=1) # b, l, t, r; leave room at top for legend
+colours = c("khaki1","indianred1","cornflowerblue","purple",'light green','grey')
+plot(pt_fc_2, from = 1, 
+     ord = c(5,4,3,2,1,6), # 5 = discharge at bottom
+     type= "filled",
+     cols = colours,
+     lwd= 2, xlab = "Days since ICU admission", ylab = "Predicted Probabilities", 
+     cex.lab = 1.25,
+     legend.pos='top',
+     legend = rep("", 6), # no labels in plot
+     main= NULL, 
+     axes=FALSE)
+# better x-axis ticks:
+axis(side=2, at=seq(0,1,0.2), labels=TRUE) # y-axis
+# 90 days
+axis(side=1, at=seq(0,90,10), labels=FALSE)
+axis(side=1, at=seq(0,90,5), labels=TRUE, tick=FALSE)
+# legend at top
+par(xpd=TRUE)
+labels = c('ICU','ECMO','Post-ECMO','Stroke','Discharge','Death')
+legend(0, 1.12, labels, col=colours, border=NA, fill=colours, bty='n', ncol=3)
+}
+plot_it()
+jpeg(filename='figures/stroke/patients_states_time.jpg', width=5, height=4, units='in', res=400, quality = 100)
+plot_it()
+invisible(dev.off())
+```
+
+The state of "stroke" has very few patients and is hard to see.
+
+## Joint models for time to stroke
+
+Here we use a joint modelling approach to try to evaluate the risk of stroke by modelling repeated patient test results over time and modelling the time to stroke.
+We use a Bayesian approach and hence the results are presented with 95% credible intervals instead of 95% confidence intervals.
+
+The models were fitted using a log-logistic distribution. The estimates are time multipliers of the median time, for example, a multipler of 2 for men would mean that the median times for men are twice as long as that for women. So multipliers over 1 mean longer times and reduced risk of stroke, whereas multipliers under 1 mean short times and an increased risk of stroke.
+
+The models ignore missing data with no imputation.
+
+The tables have estimates for two models, one for the longitudinal model, and one for the survival model.
+
+We use 'spaghetti' plots to highlight differences between patients with and without a stroke in terms of the test results measured repeatedly over time.
+Each line is the results for one patient.
+We show all patients with a stroke and a random selection of 40 patients without a stroke as plotting all patients without a stroke would make the plot too busy.
+The blue line is the mean from a simple linear regression of time. 
+We use a log scale on the y-axis because of a strong positive skew.
+
+```{r, include=FALSE}
+# just interested in transitions to stroke
+my.data.stroke = filter(my.data, from!='stroke') 
+```
+
+
+### Joint model for time to stroke using APTT
+
+```{r, joint_model_aptt}
+joint_ests_aptt = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='aptt', log_long=TRUE, censor_day=censor_day)
+# table of estimates
+table_nums(name="joint_aptt","Estimates from the joint model of APTT over time and survival.", level=1) # title, increase first number
+joint_ests_aptt$table
+# for text below
+mult = filter(joint_ests_aptt$ests, model=='Survival', term=='aptt') 
+```
+
+The estimates use `r joint_ests_aptt$numbers$N_patients` patients with `r format(joint_ests_aptt$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_aptt$numbers$N_event` strokes.
+
+A higher APTT reduces the risk of stroke. A doubling of APTT multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+##### Longitudinal plot of APTT for stroke and non-stroke patients
+
+```{r}
+to_plot = joint_ests_aptt$graph +
+  ylab('APTT (log scale)')+
+  xlab('Day since ICU admission')
+figure_nums(name="joint_aptt","APTT over time for stroke and non-stroke patients.", level=1) # increase first number 
+print(to_plot)
+```
+
+### Joint model for time to stroke using ph
+
+ph was the only variable that was not log-transformed as the original distribution did not have a strong skew.
+
+```{r, joint_model_ph}
+joint_ests_ph = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='p_h', log_long=FALSE, censor_day=censor_day, scale=0.1)
+# table of estimates
+table_nums(name="joint_ph","Estimates from the joint model of ph over time and survival.")
+joint_ests_ph$table
+# for text below
+mult = filter(joint_ests_ph$ests, model=='Survival', term=='p_h') 
+```
+
+The estimates use `r joint_ests_ph$numbers$N_patients` patients with `r format(joint_ests_ph$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_ph$numbers$N_event` strokes.
+
+A higher ph reduces the risk of stroke. Each 0.1 unit increase of ph multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+##### Longitudinal plot of ph for stroke and non-stroke patients
+
+```{r}
+to_plot = joint_ests_ph$graph +
+  ylab('ph')+
+  xlab('Day since ICU admission')
+figure_nums(name="joint_ph","ph over time for stroke and non-stroke patients.")
+print(to_plot)
+```
+
+
+### Joint model for time to stroke using PaO2
+
+```{r, joint_model_pa_o2}
+# pa_o2 is skewed so log-transform 
+joint_ests_pa_o2 = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='pa_o2', log_long=TRUE, censor_day=censor_day)
+# table of estimates
+table_nums(name="joint_pao2","Estimates from the joint model of PaO2 over time and survival.") # title
+joint_ests_pa_o2$table
+# for text below
+mult = filter(joint_ests_ph$ests, model=='Survival', term=='pa_o2') 
+```
+
+The estimates use `r joint_ests_pa_o2$numbers$N_patients` patients with `r format(joint_ests_pa_o2$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_o2$numbers$N_event` strokes.
+
+A higher PaO2 reduces the risk of stroke. A doubling of PaO2 multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+
+##### Longitudinal plot of PaO2 for stroke and non-stroke patients
+
+```{r}
+to_plot = joint_ests_pa_o2$graph +
+  ylab('PaO2 (log scale)')+
+  xlab('Day since ICU admission')
+figure_nums(name="joint_pa_o2","PaO2 over time for stroke and non-stroke patients.") 
+print(to_plot)
+```
+
+### Joint model for time to stroke using PaCO2
+
+```{r, joint_model_pa_co2}
+# pa_co2 is skewed so log-transform
+joint_ests_pa_co2 = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='pa_co2', log_long=TRUE, censor_day=censor_day)
+# table of estimates
+table_nums(name="joint_pa_co2","Estimates from the joint model of PaCO2 over time and survival.") # title
+joint_ests_pa_co2$table
+# for text below
+mult = filter(joint_ests_pa_co2$ests, model=='Survival', term=='pa_co2') 
+```
+
+The estimates use `r joint_ests_pa_co2$numbers$N_patients` patients with `r format(joint_ests_pa_co2$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_co2$numbers$N_event` strokes.
+
+A higher PaCO2 reduces the risk of stroke. A doubling of PaCO2 multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+##### Longitudinal plot of PaCO2 for stroke and non-stroke patients
+
+```{r}
+to_plot = joint_ests_pa_co2$graph +
+  ylab('PaCO2 (log scale)')+
+  xlab('Day since ICU admission')
+figure_nums(name="joint_pa_co2","PaCO2 counts over time for stroke and non-stroke patients.") 
+print(to_plot)
+```
+
+### Joint model for time to stroke using platelet count
+
+```{r, joint_model_platelet}
+# platelet_count is skewed so log-transform 
+joint_ests_platelet = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='platelet_count', log_long=TRUE, censor_day=censor_day)
+# table of estimates
+table_nums(name="joint_platelet","Estimates from the joint model of Platelet counts over time and survival.") # title
+joint_ests_platelet$table
+# for text below
+mult = filter(joint_ests_platelet$ests, model=='Survival', term=='platelet_count') 
+```
+
+The estimates use `r joint_ests_platelet$numbers$N_patients` patients with `r format(joint_ests_platelet$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_platelet$numbers$N_event` strokes.
+
+A higher platelet count increases the risk of stroke. A doubling of platelet count multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+##### Longitudinal plot of platelet count for stroke and non-stroke patients
+
+```{r}
+to_plot = joint_ests_platelet$graph +
+  ylab('Platelet count (log scale)')+
+  xlab('Day since ICU admission')
+figure_nums(name="joint_platelet","Platelet counts over time for stroke and non-stroke patients.") 
+print(to_plot)
+```
+
+
+
 
 # Appendices
 
@@ -891,8 +1648,7 @@ The hazard ratio axis is on log scale (base 10). Each row is a site and there ar
 
 ### Alternative Cox survival models for death and discharge
 
-Here we use non-parametric Cox models to confirm the results from the parametric Weibull survival models. These models use the multi-state approach, so patients could move from prone to supine (or vice versa) over time.
-These Cox models do not account for correlated results from the same patient, but they do account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
+Here we use non-parametric Cox models to confirm the results from the parametric Weibull survival models. These models use the multi-state approach. These models account for correlated results from the same site. We use a simple mean imputation for patients missing BMI.
 
 The table shows the mean hazard ratios (HRs) and 95% confidence intervals for death and discharge.
 
@@ -954,8 +1710,10 @@ for_tab = cox_models$table %>%
   select(term, HR1, CI1, HR2, CI2) %>%
   mutate(term = ifelse(term=='age', 'Age (+10 years)', term),
          term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
-         term = ifelse(term=='sexMale', 'Male', term),
-         term = ifelse(term=='stroke_o', 'Stroke - Other/Unknown', term),
+         term = ifelse(term=='sex', 'Male', term),
+         term = ifelse(term=='sofa_cHigh', 'SOFA = high', term),
+         term = ifelse(term=='sofa_cMissing', 'SOFA = missing', term),
+         term = ifelse(term=='stroke_o', 'Stroke - not specified', term),
          term = ifelse(term=='stroke_i', 'Stroke - Ischemic', term),
          term = ifelse(term=='stroke_h', 'Stroke - Hemorrhage', term))
 ## nice table
@@ -1021,7 +1779,6 @@ abline(0, 0, col=2)
 
 The plots for the non-proportional effects of hemorrhagic stroke (not shown) indicate influential observations which we address below.
 
-
 #### Discharge model with time-dependent effect of age
 
 Here we fit a Cox survival model for discharge with a separate effect of age before and after 20 days in ICU. 
@@ -1033,7 +1790,7 @@ for_split = select(my.data, -stroke_type) %>%
              age = (age-50)/10, # scaled
              bmi = (bmi-30)/5)
 # add split to data at 20 days
-for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to==5) ~ ., data= for_split, cut=c(20), episode= "tgroup", id="idx")
+for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to=='discharge') ~ ., data= for_split, cut=c(20), episode= "tgroup", id="idx")
 split_m = coxph(Surv(time=entry, time2=exit, event) ~ sex + age:strata(tgroup) + bmi + factor(from), data=for_split_split)
 ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
     mutate(
@@ -1043,7 +1800,10 @@ ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
       CI = paste(conf.low, ' to ', conf.high, sep=''),
       term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=1'), 'Age (+10 years) before 20 days in ICU', term),
       term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=2'), 'Age (+10 years) after 20 days in ICU', term),
-      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, unknown', term),
+      term = ifelse(str_detect(term, 'from\\(stroke\\)'), 'Stroke, all 3 types', term),
+      term = ifelse(str_detect(term, 'ecmo_start'), 'During ECMO', term),
+      term = ifelse(str_detect(term, 'ecmo_end'), 'Post-ECMO', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, not specified', term),
       term = ifelse(str_detect(term, 'from') &  str_detect(term, '3'), 'Stroke, ischemic', term),
       term = ifelse(str_detect(term, 'from') &  str_detect(term, '4'), 'Stroke, hemorrhage', term),
       term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
@@ -1057,9 +1817,7 @@ ftab = flextable(ests_disch_split) %>%
 ftab
 ```
 
-
-
-The stronger protective effect of age at early times is shown by the hazard ratio being well below one in early days, and then much closer to one for after 20 days.
+The stronger protective effect of age at early times is shown by the hazard ratio being smaller in the first 20 days compared with later days.
 
 #### Death model with time-dependent effect of age
 
@@ -1072,7 +1830,7 @@ for_split = select(my.data, -stroke_type) %>%
              age = (age-50)/10, # scaled
              bmi = (bmi-30)/5)
 # add split to data at 20 days
-for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to==6) ~ ., data= for_split, cut=c(9), episode= "tgroup", id="idx")
+for_split_split <- survSplit(Surv(time=entry, time2=exit, event=to=='death') ~ ., data= for_split, cut=c(9), episode= "tgroup", id="idx")
 split_m = coxph(Surv(time=entry, time2=exit, event) ~ sex + age:strata(tgroup) + bmi + factor(from), data=for_split_split)
 ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
     mutate(
@@ -1082,9 +1840,11 @@ ests_disch_split = tidy(split_m, conf.int = TRUE, exponentiate = TRUE) %>%
       CI = paste(conf.low, ' to ', conf.high, sep=''),
       term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=1'), 'Age (+10 years) before 9 days in ICU', term),
       term = ifelse(str_detect(term, 'age') &  str_detect(term, 'group=2'), 'Age (+10 years) after 9 days in ICU', term),
-      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, unknown', term),
+      term = ifelse(str_detect(term, 'from') &  str_detect(term, '2'), 'Stroke, not specified', term),
       term = ifelse(str_detect(term, 'from') &  str_detect(term, '3'), 'Stroke, ischemic', term),
       term = ifelse(str_detect(term, 'from') &  str_detect(term, '4'), 'Stroke, hemorrhage', term),
+      term = ifelse(str_detect(term, 'ecmo_start'), 'During ECMO', term),
+      term = ifelse(str_detect(term, 'ecmo_end'), 'Post-ECMO', term),
       term = ifelse(term=='bmi', 'BMI (+5 kg/m2)', term),
       term = ifelse(term=='sex', 'Male', term)) %>%
     select(term, estimate, CI) %>%
@@ -1113,7 +1873,26 @@ influence_discharge = ggcoxdiagnostics(fit=cox_models$discharge_model, sline=FAL
 influence_discharge
 ```
 
-The influential results for stroke are likely the few patients who had a stroke.
+The most influential patients are shown below and are the few patients who had a stroke.
+
+```{r}
+# look at influential observation(s)
+index = filter(influence_discharge$data, covariate=='stroke_h', abs(res) >= 0.1) %>% pull(xval)
+to_table = cox_models$discharge_data[index,] %>%
+  select(site, sex, age, bmi, stroke_h, days, cens) %>%
+  mutate(
+    cens = ifelse(cens==0, 'No', 'Yes'), # nicer labels for table
+    sex = ifelse(sex==1, 'Male', 'Female'),
+    days = round(days),
+    age = (age*10)+50, # back-transform
+    bmi = (bmi*5)+30,
+    bmi = round(bmi*10)/10) %>%
+  rename('censored' = 'cens')
+ftab = flextable(to_table) %>%
+  autofit() %>%
+  theme_box()
+ftab
+```
 
 ```{r}
 figure_nums(name="inf_death", "Influential observations for the Cox survival model of death", level=2) # title
@@ -1122,12 +1901,32 @@ influence_death = ggcoxdiagnostics(fit=cox_models$death_model, sline=FALSE, type
 influence_death
 ```
 
+The most influential patients are shown below and are the few patients who had a stroke.
+
+```{r}
+# look at influential observation(s)
+index = filter(influence_death$data, covariate=='stroke_h', abs(res) >= 0.1) %>% pull(xval)
+to_table = cox_models$discharge_data[index,] %>%
+  select(site, sex, age, bmi, stroke_h, days, cens) %>%
+  mutate(
+    cens = ifelse(cens==0, 'No', 'Yes'), # nicer labels for table
+    sex = ifelse(sex==1, 'Male', 'Female'),
+    days = round(days),
+    age = (age*10)+50, # back-transform
+    bmi = (bmi*5)+30,
+    bmi = round(bmi*10)/10) %>%
+  rename('censored' = 'cens')
+ftab = flextable(to_table) %>%
+  autofit() %>%
+  theme_box()
+ftab
+```
 
 ## Convergence of Bayesian models
 
 Here we visually check the convergence of the estimates for the Bayesian survival models for death and discharge. We plot the intercept (int), regression parameters (beta's), and Weibull shape parameter (r).
 
-```{r}
+```{r, fig.width=7}
 # plot r, beta and intercept
 to_plot = c('^r$','^beta','^int')
 index = str_detect(pattern=paste(to_plot, collapse='|'), string=dimnames(bugs_results_death$sims.array)[[3]])
@@ -1146,7 +1945,7 @@ figure_nums(name="chains_death", "Markov Chain Monte Carlo estimates for the Wei
 chain_plot
 ```
 
-```{r}
+```{r, fig.width=7}
 # plot r, beta and intercept
 to_plot = c('^r$','^beta','^int')
 index = str_detect(pattern=paste(to_plot, collapse='|'), string=dimnames(bugs_results_discharge$sims.array)[[3]])
