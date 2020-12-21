@@ -614,7 +614,7 @@ to_plot = mutate(g$data,
                  facet = paste('State moved from: ', group, sep=''))
 cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
   geom_line(size = 1.05) + # make lines thicker
-  facet_wrap(~facet)+
+  facet_wrap(~facet, scales='free_y')+
   xlab('Days since ICU admission')+
   ylab('Cumulative probability')+
   theme_bw()+
@@ -634,6 +634,8 @@ jpeg('figures/stroke/competing_risks_stroke_combined.jpg', width=6.8, height=6, 
 print(cum_plot)
 invisible(dev.off())
 ```
+
+The scales on the y-axis vary by panel. 
 
 ## Survival models
 
@@ -1134,7 +1136,7 @@ ftab
 
 ## Movements between states over time
 
-```{r, fig.width=8, fig.height=6.5}
+```{r, fig.width=9, fig.height=6.5}
 # cumulative incidence
 cum_inc = with(my.data, cuminc(ftime=exit, fstatus=to, group=from, cencode='censored'))
 # remove lines not needed (e.g., stroke to stroke)
@@ -1163,7 +1165,7 @@ to_plot = mutate(g$data,
                  facet = paste('State moved from: ', group, sep=''))
 cum_plot = ggplot(data=to_plot, aes(x=time, y=est, col=factor(event)))+
   geom_line(size = 1.05) + # make lines thicker
-  facet_wrap(~facet)+
+  facet_wrap(~facet, scales='free_y')+
   xlab('Days since ICU')+
   ylab('Cumulative probability')+
   theme_bw()+
@@ -1184,6 +1186,8 @@ print(cum_plot)
 invisible(dev.off())
 ```
 
+The scales on the y-axes vary by panel. 
+
 ```{r, fig.width=8.5, fig.height=6.5}
 # 
 to_plot = mutate(g$data, event = paste('State moved to:', event))
@@ -1192,7 +1196,7 @@ alt_plot = ggplot(data= to_plot, aes(x=time, y=est, col=factor(group)))+
   geom_line(size=1.05)+
   xlab('Days since ICU')+
   ylab('Cumulative probability')+
-scale_color_manual('State moved from:', values=(c("#CD950C", "#66CD00", "#FF00FF", "#ADD8E6")))+
+#scale_color_manual('State moved from:', values=(c("#CD950C", "#66CD00", "#FF00FF", "#ADD8E6")))+
   facet_wrap(~event, scale='free_y')+
   theme(legend.position = c(0.85,0.15),
         text = element_text(size=12))
@@ -1452,142 +1456,566 @@ The tables have estimates for two models, one for the longitudinal model, and on
 
 We use 'spaghetti' plots to highlight differences between patients with and without a stroke in terms of the test results measured repeatedly over time.
 Each line is the results for one patient.
-We show all patients with a stroke and a random selection of 40 patients without a stroke as plotting all patients without a stroke would make the plot too busy.
+We show all patients with a stroke and a random selection of 50 patients without a stroke as plotting all patients without a stroke would make the plot too busy.
 The blue line is the mean from a simple linear regression of time. 
 We use a log scale on the y-axis because of a strong positive skew.
+We split the plot according to the patients current state: ICU, During ECMO and Post-ECMO.
 
 ```{r, include=FALSE}
-# just interested in transitions to stroke
-my.data.stroke = filter(my.data, from!='stroke') 
+## separate datasets depending on stroke type 
+# create multi-state data
+# a) hemorrhagic
+hemorrhagic = mutate(patients,
+                     # blank all dates that are not hemorrhagic
+     complication_stroke_date = ifelse(stroke_group!='Hemorrhage', NA, complication_stroke_date),
+     complication_stroke_date = as.Date(complication_stroke_date, origin='1970-01-01'))
+my.data.hemorrhagic = time_transitions_string(indata=hemorrhagic,
+                intermediate_prior_ongoing= FALSE,
+                censor_day = censor_day,
+                start_state = 'date_icu',
+                int_state = 'complication_stroke_date',
+                int_state_end = NULL,
+                discharge_date = 'date_hospital_discharge',
+                dates= c('date_icu', 'date_ecmo', "date_ecmo_discontinued", 'complication_stroke_date', 'date_transfer', 'date_death','date_hospital_discharge')) %>% #
+  mutate(from !='stroke') # only interested in transitions up to stroke
+# rename from and to states
+my.data.hemorrhagic = mutate(my.data.hemorrhagic, 
+                 to = ifelse(to=='date_transfer', 'censored', to),
+                 to = ifelse(to=='date_int_state_start', 'stroke', to),
+                 to = ifelse(to=='date_ecmo_discontinued', 'ecmo_end', to),
+                 from = ifelse(from=='date_ecmo', 'ecmo_start', from),
+                 from = ifelse(from=='date_int_state_start', 'stroke', from),
+                 from = ifelse(from=='date_icu', 'icu', from),
+                 from = ifelse(from=='date_ecmo_discontinued', 'ecmo_end', from),
+                 from = ifelse(from=='icu' & to=='ecmo_end', 'ecmo_start', from)) %>% # assume ECMO at ICU start
+  mutate(age_c = (age - 60)/10, # standardising
+         bmi_c = (bmi - 28)/5) 
+# b) Ischemic          
+ischemic = mutate(patients,
+                     # blank all dates that are not hemorrhagic
+     complication_stroke_date = ifelse(stroke_group!='Ischemic', NA, complication_stroke_date),
+     complication_stroke_date = as.Date(complication_stroke_date, origin='1970-01-01'))
+my.data.ischemic = time_transitions_string(indata=ischemic,
+                intermediate_prior_ongoing= FALSE,
+                censor_day = censor_day,
+                start_state = 'date_icu',
+                int_state = 'complication_stroke_date',
+                int_state_end = NULL,
+                discharge_date = 'date_hospital_discharge',
+                dates= c('date_icu', 'date_ecmo', "date_ecmo_discontinued", 'complication_stroke_date', 'date_transfer', 'date_death','date_hospital_discharge')) %>% #
+  mutate(from !='stroke') # only interested in transitions up to stroke
+# rename from and to states
+my.data.ischemic = mutate(my.data.ischemic, 
+                 to = ifelse(to=='date_transfer', 'censored', to),
+                 to = ifelse(to=='date_int_state_start', 'stroke', to),
+                 to = ifelse(to=='date_ecmo_discontinued', 'ecmo_end', to),
+                 from = ifelse(from=='date_ecmo', 'ecmo_start', from),
+                 from = ifelse(from=='date_int_state_start', 'stroke', from),
+                 from = ifelse(from=='date_icu', 'icu', from),
+                 from = ifelse(from=='date_ecmo_discontinued', 'ecmo_end', from),
+                 from = ifelse(from=='icu' & to=='ecmo_end', 'ecmo_start', from)) %>% # assume ECMO at ICU start
+  mutate(age_c = (age - 60)/10, # standardising
+         bmi_c = (bmi - 28)/5) 
 ```
 
 
-### Joint model for time to stroke using APTT
+### Joint model for time to hemorrhagic stroke using APTT
 
-```{r, joint_model_aptt}
-joint_ests_aptt = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='aptt', log_long=TRUE, censor_day=censor_day)
+```{r, joint_model_aptt_h}
+joint_ests_aptt_hemorrhagic = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='stroke',
+                                 long_var = 'aptt', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
 # table of estimates
-table_nums(name="joint_aptt","Estimates from the joint model of APTT over time and survival.", level=1) # title, increase first number
-joint_ests_aptt$table
+table_nums(name="joint_aptt_hemorrhagic","Estimates from the joint model of APTT over time and survival for hemorrhagic stroke.", level=1) # title, increase first number
+joint_ests_aptt_hemorrhagic$table
 # for text below
-mult = filter(joint_ests_aptt$ests, model=='Survival', term=='aptt') 
+mult = filter(joint_ests_aptt_hemorrhagic$ests, model=='Time to stroke', term=='aptt') 
+
+## competing models for death/discharge
+joint_ests_aptt_hemorrhagic_death = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'aptt', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_aptt_hemorrhagic_discharge = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'aptt', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+aptt_ests_hemorrhagic = bind_rows(filter(joint_ests_aptt_hemorrhagic_death$ests, is.long==1),
+                      filter(joint_ests_aptt_hemorrhagic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'hemorrhagic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
 ```
 
-The estimates use `r joint_ests_aptt$numbers$N_patients` patients with `r format(joint_ests_aptt$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_aptt$numbers$N_event` strokes.
+The estimates use `r joint_ests_aptt_hemorrhagic$numbers$N_patients` patients with `r format(joint_ests_aptt_hemorrhagic$numbers$N_long, big.mark=',')` longitudinal observations. 
+The median number of longitudinal results per patient was `r joint_ests_aptt_hemorrhagic$numbers$long_median` (inter-quartile range `r joint_ests_aptt_hemorrhagic$numbers$long_q1` to `r joint_ests_aptt_hemorrhagic$numbers$long_q3`). 
+The time to stroke model used `r joint_ests_aptt_hemorrhagic$numbers$N_event` strokes.
 
 A higher APTT reduces the risk of stroke. A doubling of APTT multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
 
-##### Longitudinal plot of APTT for stroke and non-stroke patients
+### Joint model for time to ischemic stroke using APTT
+
+```{r, joint_model_aptt}
+joint_ests_aptt_ischemic = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 long_var = 'aptt', 
+                                 event_name='stroke',
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# table of estimates
+table_nums(name="joint_aptt_ischemic","Estimates from the joint model of APTT over time and survival for ischemic stroke.") 
+joint_ests_aptt_ischemic$table
+# for text below
+mult = filter(joint_ests_aptt_ischemic$ests, model=='Time to stroke', term=='aptt') 
+
+## competing models for death/discharge
+joint_ests_aptt_ischemic_death = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'aptt', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_aptt_ischemic_discharge = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'aptt', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+aptt_ests_ischemic = bind_rows(filter(joint_ests_aptt_ischemic_death$ests, is.long==1),
+                      filter(joint_ests_aptt_ischemic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'ischemic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
+```
+
+The estimates use `r joint_ests_aptt_ischemic$numbers$N_patients` patients with `r format(joint_ests_aptt_ischemic$numbers$N_long, big.mark=',')` longitudinal observations. 
+The median number of longitudinal results per patient was `r joint_ests_aptt_ischemic$numbers$long_median` (inter-quartile range `r joint_ests_aptt_ischemic$numbers$long_q1` to `r joint_ests_aptt_ischemic$numbers$long_q3`). The time to stroke model used `r joint_ests_aptt_ischemic$numbers$N_event` strokes.
+
+A higher APTT reduces the risk of stroke. A doubling of APTT multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+
+##### Longitudinal plot of APTT for stroke and non-stroke patients (ischemic)
 
 ```{r}
-to_plot = joint_ests_aptt$graph +
+to_plot = joint_ests_aptt_ischemic$graph +
   ylab('APTT (log scale)')+
   xlab('Day since ICU admission')
 figure_nums(name="joint_aptt","APTT over time for stroke and non-stroke patients.", level=1) # increase first number 
 print(to_plot)
 ```
 
-### Joint model for time to stroke using ph
+### Joint model for time to hemorrhagic stroke using ph
 
 ph was the only variable that was not log-transformed as the original distribution did not have a strong skew.
 
-```{r, joint_model_ph}
-joint_ests_ph = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='p_h', log_long=FALSE, censor_day=censor_day, scale=0.1)
+```{r, joint_model_ph_h}
+joint_ests_ph_hemorrhagic = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                           indata.long = daily, 
+                                           long_var = 'p_h', 
+                                           log_long = FALSE, 
+                                           event_name = 'stroke',
+                                           censor_day = censor_day, 
+                                           scale = 0.1, 
+                                           intercept.survival=FALSE)
 # table of estimates
-table_nums(name="joint_ph","Estimates from the joint model of ph over time and survival.")
-joint_ests_ph$table
+table_nums(name="joint_ph_hemorrhagic","Estimates from the joint model of ph over time and time to hemorrhagic stroke")
+joint_ests_ph_hemorrhagic$table
 # for text below
-mult = filter(joint_ests_ph$ests, model=='Survival', term=='p_h') 
+mult = filter(joint_ests_ph_hemorrhagic$ests, model=='Time to stroke', term=='p_h') 
+
+## competing models for death/discharge
+joint_ests_ph_hemorrhagic_death = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'p_h', 
+                                 scale = 0.1,
+                                 log_long = FALSE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_ph_hemorrhagic_discharge = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'p_h', 
+                                 scale = 0.1,
+                                 log_long = FALSE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+ph_ests_hemorrhagic = bind_rows(
+  filter(joint_ests_ph_hemorrhagic_death$ests, is.long==1),
+  filter(joint_ests_ph_hemorrhagic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'hemorrhagic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
 ```
 
-The estimates use `r joint_ests_ph$numbers$N_patients` patients with `r format(joint_ests_ph$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_ph$numbers$N_event` strokes.
+The estimates use `r joint_ests_ph_hemorrhagic$numbers$N_patients` patients with `r format(joint_ests_ph_hemorrhagic$numbers$N_long, big.mark=',')` longitudinal observations. The time to stroke model used `r joint_ests_ph_hemorrhagic$numbers$N_event` strokes.
+
+### Joint model for time to ischemic stroke using ph
+
+```{r, joint_model_ph}
+joint_ests_ph_ischemic = joint_survival(indata.surv=my.data.ischemic, 
+                                        indata.long=daily, 
+                                        long_var='p_h', 
+                                 event_name='stroke',
+                                        log_long=FALSE, 
+                                        censor_day=censor_day, 
+                                        scale=0.1, 
+                                        intercept.survival=TRUE)
+# table of estimates
+table_nums(name="joint_ph_ischemic","Estimates from the joint model of ph over time and time to ischemic stroke")
+joint_ests_ph_ischemic$table
+# for text below
+mult = filter(joint_ests_ph_ischemic$ests, model=='Time to stroke', term=='p_h') 
+
+## competing models for death/discharge
+joint_ests_ph_ischemic_death = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'p_h', 
+                                 log_long = FALSE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_ph_ischemic_discharge = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'p_h', 
+                                 log_long = FALSE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+ph_ests_ischemic = bind_rows(
+  filter(joint_ests_ph_ischemic_death$ests, is.long==1),
+  filter(joint_ests_ph_ischemic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'ischemic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
+```
+
+The estimates use `r joint_ests_ph_ischemic$numbers$N_patients` patients with `r format(joint_ests_ph_ischemic$numbers$N_long, big.mark=',')` longitudinal observations. The time to stroke model used `r joint_ests_ph_ischemic$numbers$N_event` strokes.
 
 A higher ph reduces the risk of stroke. Each 0.1 unit increase of ph multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
 
-##### Longitudinal plot of ph for stroke and non-stroke patients
+##### Longitudinal plot of ph for stroke and non-stroke patients (ischemic)
 
 ```{r}
-to_plot = joint_ests_ph$graph +
+to_plot = joint_ests_ph_ischemic$graph +
   ylab('ph')+
   xlab('Day since ICU admission')
-figure_nums(name="joint_ph","ph over time for stroke and non-stroke patients.")
+figure_nums(name="joint_ph","ph over time for ischemic stroke and non-ischemic-stroke patients.")
 print(to_plot)
 ```
 
 
-### Joint model for time to stroke using PaO2
+### Joint model for time to hemorrhagic stroke using PaO2
+
+```{r, joint_model_pa_o2_h}
+# pa_o2 is skewed so log-transform 
+joint_ests_pa_o2_hemorrhagic = joint_survival(indata.surv=my.data.hemorrhagic, 
+                                              indata.long=daily, 
+                                 event_name='stroke',
+                                              long_var='pa_o2', 
+                                              log_long=TRUE, 
+                                              censor_day=censor_day, 
+                                              intercept.survival=FALSE)
+# table of estimates
+table_nums(name="joint_pao2_hemorrhagic","Estimates from the joint model of PaO2 over time and time to hemorrhagic stroke") # title
+joint_ests_pa_o2_hemorrhagic$table
+# for text below
+mult = filter(joint_ests_pa_o2_hemorrhagic$ests, model=='Time to stroke', term=='pa_o2') 
+
+## competing models for death/discharge
+joint_ests_pa_o2_hemorrhagic_death = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'pa_o2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_pa_o2_hemorrhagic_discharge = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'pa_o2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+pa_o2_ests_hemorrhagic = bind_rows(
+  filter(joint_ests_pa_o2_hemorrhagic_death$ests, is.long==1),
+  filter(joint_ests_pa_o2_hemorrhagic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'hemorrhagic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
+```
+
+The estimates use `r joint_ests_pa_o2_hemorrhagic$numbers$N_patients` patients with `r format(joint_ests_pa_o2_hemorrhagic$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_o2_hemorrhagic$numbers$N_event` strokes.
+
+A higher PaO2 reduces the risk of stroke. A doubling of PaO2 multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+
+### Joint model for time to ischemic stroke using PaO2
 
 ```{r, joint_model_pa_o2}
 # pa_o2 is skewed so log-transform 
-joint_ests_pa_o2 = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='pa_o2', log_long=TRUE, censor_day=censor_day)
+joint_ests_pa_o2_ischemic = joint_survival(indata.surv=my.data.ischemic, 
+                                           indata.long=daily, 
+                                 event_name='stroke',
+                                           long_var='pa_o2', 
+                                           log_long=TRUE, 
+                                           censor_day=censor_day, 
+                                           intercept.survival=FALSE)
 # table of estimates
-table_nums(name="joint_pao2","Estimates from the joint model of PaO2 over time and survival.") # title
-joint_ests_pa_o2$table
+table_nums(name="joint_pao2_ischemic","Estimates from the joint model of PaO2 over time and time to ischemic stroke") # title
+joint_ests_pa_o2_ischemic$table
 # for text below
-mult = filter(joint_ests_ph$ests, model=='Survival', term=='pa_o2') 
+mult = filter(joint_ests_pa_o2_ischemic$ests, model=='Time to stroke', term=='pa_o2') 
+
+## competing models for death/discharge
+joint_ests_pa_o2_ischemic_death = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'pa_o2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_pa_o2_ischemic_discharge = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'pa_o2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+pa_o2_ests_ischemic = bind_rows(
+  filter(joint_ests_pa_o2_ischemic_death$ests, is.long==1),
+  filter(joint_ests_pa_o2_ischemic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'ischemic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
 ```
 
-The estimates use `r joint_ests_pa_o2$numbers$N_patients` patients with `r format(joint_ests_pa_o2$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_o2$numbers$N_event` strokes.
+The estimates use `r joint_ests_pa_o2_ischemic$numbers$N_patients` patients with `r format(joint_ests_pa_o2_ischemic$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_o2_ischemic$numbers$N_event` strokes.
 
 A higher PaO2 reduces the risk of stroke. A doubling of PaO2 multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
 
 
-##### Longitudinal plot of PaO2 for stroke and non-stroke patients
+##### Longitudinal plot of PaO2 for stroke and non-stroke patients (ischemic)
 
 ```{r}
-to_plot = joint_ests_pa_o2$graph +
+to_plot = joint_ests_pa_o2_ischemic$graph +
   ylab('PaO2 (log scale)')+
   xlab('Day since ICU admission')
-figure_nums(name="joint_pa_o2","PaO2 over time for stroke and non-stroke patients.") 
+figure_nums(name="joint_pa_o2","PaO2 over time for ischemic stroke and non-ischemic stroke patients.") 
 print(to_plot)
 ```
 
-### Joint model for time to stroke using PaCO2
+### Joint model for time to hemorrhagic stroke using PaCO2
 
-```{r, joint_model_pa_co2}
+```{r, joint_model_pa_co2_h}
 # pa_co2 is skewed so log-transform
-joint_ests_pa_co2 = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='pa_co2', log_long=TRUE, censor_day=censor_day)
+joint_ests_pa_co2_hemorrhagic = joint_survival(indata.surv=my.data.hemorrhagic, 
+                                               indata.long=daily, 
+                                 event_name='stroke',
+                                               long_var='pa_co2', 
+                                               log_long=TRUE, 
+                                               censor_day=censor_day, 
+                                               intercept.survival=FALSE)
 # table of estimates
-table_nums(name="joint_pa_co2","Estimates from the joint model of PaCO2 over time and survival.") # title
-joint_ests_pa_co2$table
+table_nums(name="joint_pa_co2_hemorrhagic","Estimates from the joint model of PaCO2 over time and time to hemorrhagic stroke") # title
+joint_ests_pa_co2_hemorrhagic$table
 # for text below
-mult = filter(joint_ests_pa_co2$ests, model=='Survival', term=='pa_co2') 
+mult = filter(joint_ests_pa_co2_hemorrhagic$ests, model=='Time to stroke', term=='pa_co2') 
+
+## competing models for death/discharge
+joint_ests_pa_co2_hemorrhagic_death = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'pa_co2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_pa_co2_hemorrhagic_discharge = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'pa_co2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+pa_co2_ests_hemorrhagic = bind_rows(
+  filter(joint_ests_pa_co2_hemorrhagic_death$ests, is.long==1),
+  filter(joint_ests_pa_co2_hemorrhagic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'hemorrhagic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
 ```
 
-The estimates use `r joint_ests_pa_co2$numbers$N_patients` patients with `r format(joint_ests_pa_co2$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_co2$numbers$N_event` strokes.
+The estimates use `r joint_ests_pa_co2_hemorrhagic$numbers$N_patients` patients with `r format(joint_ests_pa_co2_hemorrhagic$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_pa_co2_hemorrhagic$numbers$N_event` strokes.
 
 A higher PaCO2 reduces the risk of stroke. A doubling of PaCO2 multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
 
-##### Longitudinal plot of PaCO2 for stroke and non-stroke patients
+### Joint model for time to ischemic stroke using PaCO2
+
+```{r, joint_model_pa_co2_i}
+# pa_co2 is skewed so log-transform
+joint_ests_pa_co2_ischemic = joint_survival(indata.surv=my.data.ischemic, 
+                                            indata.long=daily, 
+                                 event_name='stroke',
+                                            long_var='pa_co2', 
+                                            log_long=TRUE, 
+                                            censor_day=censor_day, 
+                                            intercept.survival=FALSE)
+# table of estimates
+table_nums(name="joint_pa_co2_ischemic","Estimates from the joint model of PaCO2 over time and time to ischemic stroke") # title
+joint_ests_pa_co2_ischemic$table
+# for text below
+mult = filter(joint_ests_pa_co2_ischemic$ests, model=='Time to stroke', term=='pa_co2') 
+
+## competing models for death/discharge
+joint_ests_pa_co2_ischemic_death = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'pa_co2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+joint_ests_pa_co2_ischemic_discharge = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'pa_co2', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE)
+# store estimates
+pa_co2_ests_ischemic = bind_rows(
+  filter(joint_ests_pa_co2_ischemic_death$ests, is.long==1),
+  filter(joint_ests_pa_co2_ischemic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'ischemic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
+```
+
+##### Longitudinal plot of PaCO2 for stroke and non-stroke patients (hemorrhagic)
 
 ```{r}
-to_plot = joint_ests_pa_co2$graph +
+to_plot = joint_ests_pa_co2_hemorrhagic$graph +
   ylab('PaCO2 (log scale)')+
   xlab('Day since ICU admission')
-figure_nums(name="joint_pa_co2","PaCO2 counts over time for stroke and non-stroke patients.") 
+figure_nums(name="joint_pa_co2","PaCO2 counts over time for hemorrhagic stroke and patients with a hemorrhagic stroke") 
 print(to_plot)
 ```
 
-### Joint model for time to stroke using platelet count
+### Joint model for time to hemorrhagic stroke using platelet count
 
 ```{r, joint_model_platelet}
 # platelet_count is skewed so log-transform 
-joint_ests_platelet = joint_survival(indata.surv=my.data.stroke, indata.long=daily, long_var='platelet_count', log_long=TRUE, censor_day=censor_day)
+joint_ests_platelet_hemorrhagic = joint_survival(indata.surv=my.data.hemorrhagic, 
+                                                 indata.long=daily, 
+                                 event_name='stroke',
+                                                 long_var='platelet_count', 
+                                                 log_long=TRUE, 
+                                                 censor_day=censor_day, 
+                                                 intercept.survival = FALSE,
+                                                 outliers = 2) # cut a few very odd low platelet counts
 # table of estimates
-table_nums(name="joint_platelet","Estimates from the joint model of Platelet counts over time and survival.") # title
-joint_ests_platelet$table
+table_nums(name="joint_platelet_hemorrhagic","Estimates from the joint model of Platelet counts over time and time to hemorrhagic stroke") # title
+joint_ests_platelet_hemorrhagic$table
 # for text below
-mult = filter(joint_ests_platelet$ests, model=='Survival', term=='platelet_count') 
+mult = filter(joint_ests_platelet_hemorrhagic$ests, model=='Time to stroke', term=='platelet_count') 
+
+## competing models for death/discharge
+joint_ests_platelet_count_hemorrhagic_death = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'platelet_count', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE, 
+                                 outliers = 2)
+joint_ests_platelet_count_hemorrhagic_discharge = joint_survival(indata.surv = my.data.hemorrhagic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'platelet_count', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE,
+                                 outliers = 2)
+# store estimates
+platelet_count_ests_hemorrhagic = bind_rows(
+  filter(joint_ests_platelet_count_hemorrhagic_death$ests, is.long==1),
+  filter(joint_ests_platelet_count_hemorrhagic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'hemorrhagic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
 ```
 
-The estimates use `r joint_ests_platelet$numbers$N_patients` patients with `r format(joint_ests_platelet$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_platelet$numbers$N_event` strokes.
+The estimates use `r joint_ests_platelet_hemorrhagic$numbers$N_patients` patients with `r format(joint_ests_platelet_hemorrhagic$numbers$N_long, big.mark=',')` longitudinal observations. The survival model used `r joint_ests_platelet_hemorrhagic$numbers$N_event` strokes.
 
-A higher platelet count increases the risk of stroke. A doubling of platelet count multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`).
+Platelet count had no clear effect on the risk of stroke. A doubling of platelet count multiplies the median time to stroke by `r mult$mean` (95% credible interval `r mult$lower` to `r mult$upper`). As the 95% CI includes 1 the effect of platelet count is not certain.
 
-##### Longitudinal plot of platelet count for stroke and non-stroke patients
+### Joint model for time to ischemic stroke using platelet count
+
+```{r, joint_model_platelet_i}
+# platelet_count is skewed so log-transform 
+joint_ests_platelet_ischemic = joint_survival(indata.surv=my.data.ischemic, 
+                                              indata.long=daily, 
+                                 event_name='stroke',
+                                              long_var='platelet_count', 
+                                              log_long=TRUE, 
+                                              censor_day=censor_day, 
+                                              intercept.survival = FALSE,
+                                              outliers = 2)
+# table of estimates
+table_nums(name="joint_platelet_ischemic","Estimates from the joint model of Platelet counts over time and time to ischemic stroke") # title
+joint_ests_platelet_ischemic$table
+# for text below
+mult = filter(joint_ests_platelet_ischemic$ests, model=='Time to stroke', term=='platelet_count') 
+
+## competing models for death/discharge
+joint_ests_platelet_count_ischemic_death = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='death',
+                                 long_var = 'platelet_count', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE,
+                                 outliers = 2)
+joint_ests_platelet_count_ischemic_discharge = joint_survival(indata.surv = my.data.ischemic, 
+                                 indata.long = daily, 
+                                 event_name='discharge',
+                                 long_var = 'platelet_count', 
+                                 log_long = TRUE, 
+                                 censor_day = censor_day, 
+                                 intercept.survival = FALSE,
+                                 outliers = 2)
+# store estimates
+platelet_count_ests_ischemic = bind_rows(
+  filter(joint_ests_platelet_count_ischemic_death$ests, is.long==1),
+  filter(joint_ests_platelet_count_ischemic_discharge$ests, is.long==1), .id ='model') %>%
+  mutate(
+    stroke_type = 'ischemic',
+    model = factor(model, levels=1:2, labels=c('Death','Discharge')))
+
+```
+
+##### Longitudinal plot of platelet count for hemorrhagic stroke and patients without a hemorrhagic stroke
 
 ```{r}
-to_plot = joint_ests_platelet$graph +
+to_plot = joint_ests_platelet_hemorrhagic$graph +
   ylab('Platelet count (log scale)')+
   xlab('Day since ICU admission')
 figure_nums(name="joint_platelet","Platelet counts over time for stroke and non-stroke patients.") 
@@ -1595,6 +2023,128 @@ print(to_plot)
 ```
 
 
+### Joint models summary plot
+
+The plot below shows the estimates for the joint models for the longitudinal association for the time to stroke.
+
+```{r, summary_plot}
+# combine estimates
+comb = bind_rows(joint_ests_pa_o2_hemorrhagic$ests,
+                 joint_ests_pa_o2_ischemic$ests,
+                 joint_ests_pa_co2_hemorrhagic$ests,
+                 joint_ests_pa_co2_ischemic$ests,
+                 joint_ests_aptt_hemorrhagic$ests,
+                 joint_ests_aptt_ischemic$ests,
+                 joint_ests_platelet_hemorrhagic$ests,
+                 joint_ests_platelet_ischemic$ests,
+                 joint_ests_ph_hemorrhagic$ests,
+                 joint_ests_ph_ischemic$ests, .id='hi') %>%
+  filter(is.long==1) %>% # just the longitudinal
+  mutate(
+  group_nice = as.numeric(as.numeric(hi)%%2 == 0), # even numbers
+  group_nice = factor(group_nice, levels=0:1, labels=c('Hemorrhagic','Ischemic')),
+  xaxis = case_when(
+    term =='aptt' ~ 1,
+    term =='p_h' ~ 2,
+    term =='platelet_count' ~ 3,
+    term =='pa_o2' ~ 4,
+    term =='pa_co2' ~ 5
+  ),
+  xaxis = xaxis + (as.numeric(hi)%%2/10)) #dodge
+#
+xaxis_labels = c('APTT (double)','pH (per 0.1)','Platelet count (double)','PaO2 (double)','PaCO2 (double)')
+# annotation
+labels = data.frame(xaxis=0.9, mean=1, lower=1, upper=1, label=c('Increased risk','Decreased risk'))
+# 
+gplot = ggplot(data=comb, aes(x=xaxis, y=mean, ymin=lower, ymax=upper, col=factor(group_nice)))+
+  geom_hline(lty=2, yintercept=1)+ # reference line
+  scale_x_continuous(breaks=1:5, labels=xaxis_labels)+
+  geom_text(data=labels, size=3, aes(x=xaxis, y=mean, label=label), col='black', hjust=c(-0.1, 1.1))+
+  geom_point(size=2)+
+  geom_errorbar(width=0, size=1.05)+
+  scale_color_manual(NULL, values=c('darkred','seagreen3'))+
+  theme_bw()+
+  xlab('')+
+  ylab('Multiplier')+
+  coord_flip()+
+  theme(legend.position = 'top')
+figure_nums(name="joint_summary","Summary plot of the joint model estimates on the time to stroke")
+gplot
+```
+
+
+### Within-patient correlation for longitudinal variables
+
+Some of the effect sizes about are remarkably similar, this could be because they are strongly correlated within patients. Here we examine the within patient correlation in variables. We log transformed (base 2) all the variables except pH.
+
+```{r}
+for_corr = select(daily, aptt, platelet_count, pa_co2, pa_o2, p_h) %>%
+  mutate(aptt = log2(aptt),
+         pa_o2 = log2(pa_o2),
+         pa_co2 = log2(pa_co2),
+         platelet_count = log2(platelet_count)) %>%
+  as.matrix()
+c = as.data.frame(cor(for_corr, use='pairwise.complete.obs')) %>%
+  mutate_all(funs(roundz(., 2)))
+tab = mutate(c, Variable = colnames(c)) %>%
+  select(Variable, everything())
+ftab = flextable(tab) %>%
+  theme_box
+ftab
+```
+
+
+### Joint models summary plot for competing outcomes of death and discharge
+
+The plot below shows the estimates for the joint models for the effect of the longitudinal variable on death and discharge.
+
+```{r, summary_plot_competing, fig.width=7, fig.height=6}
+# combine estimates
+comb = bind_rows(aptt_ests_ischemic,
+                 aptt_ests_hemorrhagic,
+                 pa_o2_ests_ischemic,
+                 pa_o2_ests_hemorrhagic,
+                 pa_co2_ests_ischemic,
+                 pa_co2_ests_hemorrhagic,
+                 platelet_count_ests_ischemic,
+                 platelet_count_ests_hemorrhagic,
+                 ph_ests_ischemic,
+                 ph_ests_hemorrhagic) %>%
+  mutate(
+  xaxis = case_when(
+    term =='aptt' ~ 1,
+    term =='p_h' ~ 2,
+    term =='platelet_count' ~ 3,
+    term =='pa_o2' ~ 4,
+    term =='pa_co2' ~ 5
+  ),
+  xaxis = xaxis + (as.numeric(stroke_type=='ischemic')/8)) #dodge
+#
+xaxis_labels = c('APTT (double)','pH (per 0.1)','Platelet count (double)','PaO2 (double)','PaCO2 (double)')
+# annotation
+labels = data.frame(xaxis=0.9, mean=1, lower=0, upper=0, stroke_type=NA, 
+                    model = factor(c(1,1,2,2), levels=c(1,2), labels=c('Death','Discharge')),
+                    label=c('Increased risk','Decreased risk','Increased risk','Decreased risk'))
+# 
+gplot = ggplot(data=comb, aes(x=xaxis, y=mean, ymin=lower, ymax=upper, col=factor(stroke_type)))+
+  geom_hline(lty=2, yintercept=1)+ # reference line
+  geom_text(data=labels, size=3, aes(x=xaxis, y=mean, label=label), col='black', hjust=c(-0.1, 1.1, -0.1, 1.1))+
+  scale_x_continuous(breaks=1:5, labels=xaxis_labels)+
+  scale_y_log10()+
+  geom_point(size=2)+
+  geom_errorbar(width=0, size=1.05)+
+  scale_color_manual(NULL, values=c('darkred','seagreen3'))+
+  theme_bw()+
+  xlab('')+
+  ylab('Multiplier')+
+  coord_flip()+
+  facet_wrap(~model)+
+  theme(legend.position = 'top')
+figure_nums(name="joint_summary_competing","Summary plot of the joint model estimates on the time to death and discharge")
+gplot
+```
+
+The results for hemorrhagic and ischemic stroke are almost identical for each combination of longitudinal variable and outcome (death/discharge). This is not surprising given the relatively small number of strokes, which means that the risks of death and discharge are relatively unchanged for the two stroke types.
 
 
 # Appendices
@@ -1611,7 +2161,7 @@ centres_death = bugs_extract(inbugs=bugs_results_death, var='^centre', exp=TRUE)
 centres_discharge = bugs_extract(inbugs=bugs_results_discharge, var='^centre', exp=TRUE) %>% # from 99_functions.R
   mutate(type = 2)
 # annotation
-labels = data.frame(row=0, mean=1, lower=0, upper=0, facet=1, label=c('Increased hazard','Decreased hazard'))
+labels = data.frame(row=0, mean=1, lower=1, upper=1, facet=1, label=c('Increased hazard','Decreased hazard'))
 # combine estimates
 centres = bind_rows(centres_death, centres_discharge) %>%
   group_by(row) %>%

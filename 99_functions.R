@@ -661,6 +661,18 @@ time_transitions_string = function(indata,
 
   ## fix dates
   ## cannot tell what happened after transfers, so blank dates
+  # if transfer date on discharge date then blank transfer
+  index = indata$date_transfer == indata$discharge_date & !is.na(indata$discharge_date) & !is.na(indata$date_transfer)
+  indata$date_transfer[index] = NA
+  # if transfer date on death date then blank transfer
+  index = indata$date_transfer == indata$date_death & !is.na(indata$date_death) & !is.na(indata$date_transfer)
+  indata$date_transfer[index] = NA
+  # if transfer date before ECMO then blank ECMO
+  index = indata$date_transfer <= indata$date_ecmo & !is.na(indata$date_ecmo) & !is.na(indata$date_transfer)
+  indata$date_ecmo[index] = NA
+  # if transfer date before ECMO end then blank ECMO end
+  index = indata$date_transfer <= indata$date_ecmo_discontinued & !is.na(indata$date_ecmo_discontinued) & !is.na(indata$date_transfer)
+  indata$date_ecmo_discontinued[index] = NA
   # if transfer date before discharge then blank discharge
   index = indata$date_transfer <= indata$discharge_date & !is.na(indata$discharge_date) & !is.na(indata$date_transfer)
   indata$discharge_date[index] = NA
@@ -725,7 +737,13 @@ time_transitions_string = function(indata,
     #if(n == 1){cat(this_patient$pin, '\n')}
     if(n > 1){ # only for patients with at least one transition
       for (r in 1:(n-1)){
-        f = data.frame(pin = u, from=this_patient$event[r], to=this_patient$event[r+1], entry=this_patient$time[r], exit=this_patient$time[r+1])
+        f = data.frame(pin = u, 
+                       from = this_patient$event[r], 
+                       to = this_patient$event[r+1], 
+                       entry = this_patient$time[r], 
+                       exit = this_patient$time[r+1],
+                       entry_date = this_patient$date[r], # add dates for joint models
+                       exit_date = this_patient$date[r+1])
         time_dep_data = bind_rows(time_dep_data, f)
       }
     }
