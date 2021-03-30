@@ -474,7 +474,23 @@ ftab
 
 Here we examine whether there are important predictors of whether patients get prone positioning. This is important because prone positioning was not a randomly allocated treatment, hence patients who get prone may have important differences from patients who do not. This could then cause confounding when we examine the effects of prone on death and discharge. Understanding the differences between patients who did and did not receive prone positioning will help us understand the potential biases and will also be use to create weights for a propensity weighted analysis.
 
-In the model diagram above, we are interested in all the transitions (arrows) except those from the "ECMO and prone" state, as we are just examining when a patient experiences prone or moves to death or discharge before they can experience prone.
+### Model diagram (for models of prone)
+
+```{r}
+states = c('ECMO &\nsupine','ECMO &\nprone','Death','Discharge\nfrom hospital')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  3,1,
+  4,1
+), byrow = TRUE, ncol=2)
+figure_nums(name="model_diagram2", "The three states in the model and the possible movements between states", level=1) # title
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
+jpeg(filename='figures/prone/state_diagram_prone.jpg', width=4, height=4, units='in', res=400, quality = 100)
+multistate_diagram(states=states, links = M, pos = c(1, 2, 1), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
+invisible(dev.off())
+```
+
 
 ### Cumulative risk plot for prone positioning
 
@@ -586,7 +602,7 @@ bdata = list(N = N,
 ```{r, include=FALSE}
 ## run the survival model in WinBUGS
 n.chains= 2
-MCMC = 10000 # increase to 10,000 for final run
+MCMC = 20000 # increase to 10,000 for final run
 thin = 5 # 
 
 # initial values for single variable outcome (use mean for intercept)
@@ -628,6 +644,112 @@ Older patients have a reduced hazard of being put in a prone position (HR = `r b
 Patients with a higher BMI have a reduced hazard of being put in a prone position (HR = `r beta$mean[4]`).
 
 There were `r sum(for_prone$to=='cens')` patients who were administratively censored, meaning they were not yet discharged or dead by the end of the study.
+
+## Survival model for prone positioning without random site effect
+
+Here we repeat the above model but without the random site effect.
+
+```{r, winbugs_model}
+# bugs model
+bfile = 'bugs_survival_prone_no_site.txt'
+bugs = file(bfile, 'w')
+cat('model{
+    for (i in 1:N){
+      days[i] ~ dweib(r, mu[i])I(cens[i],) # right-censoring
+      log(mu[i]) <- int + beta[1]*sex[i] + beta[2]*age[i] + beta[3]*calendar_time[i] + beta[4]*bmi[i] + beta[5]*prone_before[i]
+      bmi[i] ~ dnorm(mu.bmi, tau.bmi) # missing BMI
+      prone_before[i] ~ dbern(p) # missing prone before
+    }
+    # priors
+    mu.bmi ~ dnorm(0, 0.1) # vaguely informative (scaled)
+    p ~ dbeta(1, 1) # 
+    tau.bmi ~ dgamma(1, 1)
+    int ~ dnorm(0, 0.0001)
+    for(k in 1:5){beta[k] ~ dnorm(0, 0.0001)}
+    r ~ dexp(1)
+}', file=bugs)
+close(bugs)
+```
+
+```{r, include=FALSE}
+# set up survival data for winbugs (without site)
+bdata = list(N = N, 
+             days = for_prone$days,
+             cens = for_prone$cens,
+             prone_before = as.numeric(for_prone$ecmo_prone_before=='Yes'),
+             sex = as.numeric(for_prone$sex=='Male'),
+             age = (for_prone$age-50)/10, # scaled
+             bmi = (for_prone$bmi-30)/5, # scaled
+             calendar_time = (as.numeric(for_prone$date_ecmo)-18367)/31 ) # centre and scale to one month
+```
+
+```{r, include=FALSE}
+## run the survival model in WinBUGS
+n.chains= 2
+MCMC = 20000 # increase to 10,000 for final run
+thin = 5 # 
+
+# initial values for single variable outcome (use mean for intercept)
+inits = list(r=1, beta=rep(0,5), p=0.5, int=0, mu.bmi=0, tau.bmi=1) 
+inits = rep(list(inits), n.chains) # repeat initial values per chain
+
+## run WinBUGS
+parameters = c('r','beta','int','bmi')
+# do not run model if there are already estimates (save time)
+any_model = length(dir(path='results', pattern='prone_no_site')) > 0
+# run model
+if(any_model == FALSE){
+  bugs_results_prone_no_site = bugs(data=bdata, inits=inits, parameters=parameters, model.file=bfile, DIC=TRUE, n.chains=n.chains, n.iter=MCMC*thin*2, n.thin=thin, bugs.seed=87947, debug=debug, bugs.directory=bugs_location)
+  save(bugs_results_prone_no_site, file='results/survival_prone_no_site.RData')
+}
+if(any_model == TRUE){
+  load('results/survival_prone_no_site.RData')
+}
+# 
+```
+
+
+```{r}
+## tabulate the results
+# get beta estimates
+beta = bugs_extract(inbugs=bugs_results_prone_no_site, var='beta', exp=TRUE, names=c('Male','Age (+10 years)','Calendar time (+30 days)','BMI (+5 kg/m2)',"Prone before ECMO"), digits=2, make.ci=TRUE) # from 99_functions.R
+ftab = rename(beta, 'HR' = 'mean') %>%
+  flextable() %>%
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit()
+table_nums(name="hr_weibull_prone", "Hazard ratios and 95% credible intervals for prone position from the Weibull model with no site effect")
+ftab
+```
+
+Older patients have a reduced hazard of being put in a prone position (HR = `r beta$mean[2]`).
+Patients with a higher BMI have a reduced hazard of being put in a prone position (HR = `r beta$mean[4]`).
+
+
+
+### Check Weibull assumption for time to prone
+
+```{r}
+# see http://www.drizopoulos.com/courses/emc/ep03_%20survival%20analysis%20in%20r%20companion
+# a) refit model using R (non-Bayesian)
+for_residual = mutate(for_prone, 
+                      ecmo_prone_before = ifelse(is.na(ecmo_prone_before), 2, ecmo_prone_before),
+                      bmi = ifelse(is.na(bmi), 30, bmi)) # simple replace of missing with median
+#                      )
+fit_weib <- survreg(Surv(exit+0.001, event=to =='2') ~ bmi + sex + age + date_ecmo + ecmo_prone_before, data = for_residual) # event is prone
+# b) make residuals
+fitted_values <- fit_weib$linear.predictors
+resids <- (log(fit_weib$y[, 1]) - fitted_values) / fit_weib$scale
+# c) plot
+resKM <- survfit(Surv(resids, event=to =='2') ~ 1, data = for_residual)
+plot(resKM, mark.time = FALSE, xlab = "AFT Residuals", ylab = "Survival Probability")
+xx <- seq(min(resids), max(resids), length.out = 35)
+yy <- exp(- exp(xx))
+lines(xx, yy, col = "red", lwd = 2)
+legend("bottomleft", c("KM estimate", "95% CI KM estimate", 
+    "Survival function of Weibull distribution"), 
+    lty = c(1,2,1), col = c(1,1,2), bty = "n")
+```
 
 # Models of death and discharge
 
@@ -992,6 +1114,57 @@ Calendar time has a strong effect on discharge (HR = `r for_table$mean2[3]`), wi
 
 There were `r nrow(censored)` patients who were administratively censored, meaning they were not yet discharged or dead by the end of the study.
 
+### Check Weibull assumption for death and discharge
+
+#### a) Death
+
+```{r}
+# see http://www.drizopoulos.com/courses/emc/ep03_%20survival%20analysis%20in%20r%20companion
+# a) refit model using R (non-Bayesian)
+for_residual = mutate(my.data, 
+                      exit = ifelse(entry > 0, exit - entry, exit), # subtract starting days if delayed start
+                      ecmo_prone_before = ifelse(is.na(ecmo_prone_before), 2, ecmo_prone_before), # mode
+                      bmi = ifelse(is.na(bmi), 30, bmi)) # simple replace of missing with median
+#                      )
+fit_weib <- survreg(Surv(exit+0.001, event=to =='4') ~ bmi + sex + age + date_ecmo + I(from==2) + ecmo_prone_before, data = for_residual) # event is death
+# b) make residuals
+fitted_values <- fit_weib$linear.predictors
+resids <- (log(fit_weib$y[, 1]) - fitted_values) / fit_weib$scale
+# c) plot
+resKM <- survfit(Surv(resids, event=to =='4') ~ 1, data = for_residual)
+plot(resKM, mark.time = FALSE, xlab = "AFT Residuals", ylab = "Survival Probability")
+xx <- seq(min(resids), max(resids), length.out = 35)
+yy <- exp(- exp(xx))
+lines(xx, yy, col = "red", lwd = 2)
+legend("bottomleft", c("KM estimate", "95% CI KM estimate", 
+    "Survival function of Weibull"), 
+    lty = c(1,2,1), col = c(1,1,2), bty = "n")
+# residual plot
+# qqnorm(resids); qqline(resids)
+```
+
+#### b) Discharge
+
+```{r}
+# see http://www.drizopoulos.com/courses/emc/ep03_%20survival%20analysis%20in%20r%20companion
+# a) refit model using R (non-Bayesian)
+fit_weib <- survreg(Surv(exit+0.001, event=to =='3') ~ bmi + sex + age + date_ecmo + I(from==2) + ecmo_prone_before, data = for_residual) # event is death
+# b) make residuals
+fitted_values <- fit_weib$linear.predictors
+resids <- (log(fit_weib$y[, 1]) - fitted_values) / fit_weib$scale
+# c) plot
+resKM <- survfit(Surv(resids, event=to =='3') ~ 1, data = for_residual)
+plot(resKM, mark.time = FALSE, xlab = "AFT Residuals", ylab = "Survival Probability")
+xx <- seq(min(resids), max(resids), length.out = 35)
+yy <- exp(- exp(xx))
+lines(xx, yy, col = "red", lwd = 2)
+legend("bottomleft", c("KM estimate", "95% CI KM estimate", 
+    "Survival function of Weibull"), 
+    lty = c(1,2,1), col = c(1,1,2), bty = "n")
+# residual plot
+# qqnorm(resids); qqline(resids)
+```
+
 ## Cumulative survival models
 
 The survival models in this section focus on the patients' final (or cumulative) outcome of death and discharge, whereas the previous models examined the instantaneous hazard of experiencing death or discharge. 
@@ -1119,8 +1292,8 @@ my.data.cens = mutate(my.data,
   filter(exit - entry > 0.5) # remove few small jumps
 for (k in 1:nrow(my.data.cens)){
   this_row = my.data.cens[k,]
-  f = data.frame(pin=this_row$id, days=seq(this_row$entry, this_row$exit-1, 1), state=as.numeric(this_row$from))
-  f_last = data.frame(pin=this_row$id, days=this_row$exit, state=as.numeric(this_row$to))
+  f = data.frame(pin=this_row$pin, days=seq(this_row$entry, this_row$exit-1, 1), state=as.numeric(this_row$from))
+  f_last = data.frame(pin=this_row$pin, days=this_row$exit, state=as.numeric(this_row$to))
   long = bind_rows(long, f, f_last)
 }
 # quick check
@@ -1191,15 +1364,16 @@ The panels are split by the patient's final state (death, discharge or censored)
 expand = NULL
 my.data = mutate(my.data, 
                  to = ifelse(to=='cens', 0, to), # changed censored back to 0
+                 from = as.numeric(from),
                  to = as.numeric(to))
 for (i in 1:nrow(my.data)){
   if(nrow(my.data[i,]) > 0){
-    f = with(my.data[i,], data.frame(id=id, state=from, days=entry:(exit-1)))
-    flast = with(my.data[i,], data.frame(id=id, state=to, days=exit))
+    f = with(my.data[i,], data.frame(id=pin, state=from, days=entry:(exit-1)))
+    flast = with(my.data[i,], data.frame(id=pin, state=to, days=exit))
   }
   if(nrow(my.data[i,]) == 0){
     f = NULL
-    flast = with(my.data[i,], data.frame(id=id, state=to, days=exit))
+    flast = with(my.data[i,], data.frame(id=pin, state=to, days=exit))
   }
   expand = bind_rows(expand, f, flast)
 }
@@ -1318,8 +1492,9 @@ Random effects for sites from the survival models.
 
 ```{r, fig.width=5, fig.height=6}
 # get site estimates
+load('results/survival_prone.RData') # get estimates 
 centres = bugs_extract(inbugs=bugs_results_prone, var='^centre', exp=TRUE, arrange=TRUE) %>% # from 99_functions.R
-  mutate(over = as.numeric(lower>1) + 1) # for colouring estimats
+  mutate(over = as.numeric(lower>1) + 1) # for colouring estimates
 # annotation
 labels = data.frame(row=0, mean=1, lower=0, upper=0, over=1, label=c('Increased hazard','Decreased hazard'))
 # plot
@@ -1340,12 +1515,44 @@ cplot = ggplot(data=centres, aes(x=row, y=mean, ymin=lower, ymax=upper, col=fact
         panel.grid.major.y = element_blank())
 figure_nums(name="site_prone", "Site effects from the Weibull survival model for prone position", level=1) # title
 cplot
+jpeg('figures/prone/left_out_prone.jpg', width=4.5, height=5.5, units='in', res=500, quality=100)
+print(cplot)
+invisible(dev.off())
 ```
 
 The plot shows the mean hazard ratio per site (circle) and 95% credible interval (horizontal line) for the `r n_sites` sites. The dotted vertical line is at a hazard ratio of 1 and indicated no change in hazard. Sites below the line have a decreased hazard of prone position, whilst sites above the line have an increased hazard. Sites with a lower limit above the line have been coloured red. Sites have been ordered using their mean hazard ratio. 
 The wide credible intervals indicate large uncertainty in most sites, and this is because of the small number of patients in most sites. The hazard ratio is on a log scale (base 10).
 
 There are `r sum(centres$over==2)` sites that have a relatively large hazard ratio for putting patients in prone position. This could be because prone positioning is an accepted practice at those sites.
+
+##### Site effects (prone positioning): details on the influential sites
+
+```{r}
+# get centre numbers that look high
+high = filter(centres, over==2) %>%
+  mutate(
+    text = row.names(.),
+    num = as.numeric(str_remove_all(text, '[^0-9]'))) %>% # get centre number
+  pull(num)
+# add back to original data
+for_prone_original = mutate(for_prone,
+                   high = site_num %in% high)
+# now get statistics per site
+stats = group_by(for_prone_original, site_num, high) %>%
+  summarise(n = n(),
+            exit = mean(exit, na.rm=TRUE), # average time
+            censored = sum(as.numeric(to=='cens')), # number censored
+            prone = sum(as.numeric(to=='2'))) # movements to prone
+ftab = filter(stats, high==TRUE) %>%
+  select(-high) %>%
+  flextable() %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
+
+The table above shows the summary statistics for the three sites that were relative outliers in terms of prone positioning.
+
 
 ##### Site effects (death and discharge)
 
@@ -1591,7 +1798,7 @@ Prone position reduces the hazard of death and discharge.
 
 ```{r}
 # run simple model of censoring times, recommended by https://arxiv.org/pdf/2005.13271.pdf
-times_censor = survival::survfit(Surv(time=entry, time2=exit, event= to==0) ~ 1 + cluster(id), data=my.data) # event is censored
+times_censor = survival::survfit(Surv(time=entry, time2=exit, event= to==0) ~ 1 + cluster(pin), data=my.data) # event is censored
 # report median censoring time
 g = ggsurvplot(times_censor, data = my.data,
                legend.labs=NULL,
