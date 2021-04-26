@@ -11,120 +11,12 @@ output:
 knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, comment='', dpi=400)
 options(width=1000) # Wide pages
 options(scipen=999) # avoid scientific presentation
-z = qnorm(0.975)
-source('99_functions.R')
-library(pander)
-library(dplyr)
-library(stringr)
-library(tidyr)
-library(flextable) # for nice tables
-#library(broom)
-library(summarytools)
-# global options for summary tools
- st_options(plain.ascii = FALSE,       # This is very handy in all Rmd documents
-            style = "rmarkdown",        # This too
-            round.digits = 0, 
-            headings = FALSE, 
-            display.labels = FALSE,
-            footnote = NA,             # Avoids footnotes which would clutter the results
-            subtitle.emphasis = FALSE  # 
- ) 
-
-# graphics things:
-library(visdat) # for missing data
-library(ggplot2)
-library(ggupset)  # to plot combination of symptoms
-g.theme = theme_bw() + theme(panel.grid.minor = element_blank())
-cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#999999", "#CC79A7")
-
-## get the data
 source = 'real_data'
 #source = 'dummy_data'
-if(source == 'dummy_data'){
-  load(file='data/COVID_Data_stroke_dummy.RData') # from 0_read_data.R, dummy data
-  # fixes with stroke
-  patients = mutate(patients,
-          stroke_group = ifelse(is.na(complication_stroke_date)==TRUE, 'None', stroke_group), # blank stroke group for those with no date
-          stroke_group = ifelse(is.na(complication_stroke_date)==FALSE, sample(c('Hemorrhage','Ischemic','Other/Unknown','None'), size=n(), replace=TRUE), stroke_group) # randomly add stroke group for those with a date
-                    )
-}
-if(source == 'real_data'){
-  load(file='data/COVID_Data_stroke.RData') # from 0_read_data.R
-}
-
-# make last possible date based on database freeze
-last_possible = as.Date(paste(data_date$day, data_date$month, '2020', sep='-'), format='%d-%b-%Y')
-
-## data edits
-# a) patients
-patients = select(patients, 'pin', 'country','age', 'sex', 'ethnicity',
-                  "height","weight",'date_admission','date_hospital_discharge',
-                  'comorbidity_chronic_kidney_disease','comorbidity_severe_liver_disease',
-                  'comorbidity_diabetes','comorbidity_hypertension',
-                  'sofa','date_icu','date_ecmo','date_ecmo_discontinued',
-                  'ecmo_type','ecmo_drainage_cannula_insertion_site',
-                  'ecmo_return_cannula_insertion_site',
-                  "ecmo_cardiac_arrest_before", "ecmo_worst_pa_o2_6hr_before",
-                  "ecmo_worst_pa_co2_6hr_before", 'ecmo_continuous_rpt_before',
-                  starts_with("complication_"), 'stroke_during_treatment','stroke_type', 'outcome') %>% # slim down variables
-  # impossible admission date set to missing:
-  mutate(date_admission = ifelse(date_admission >= last_possible, NA, date_admission), 
-         date_admission = as.Date(date_admission, origin='1970-01-01'),
-         # update stroke to add EOT
-         complication_stroke = ifelse(!is.na(stroke_during_treatment) & stroke_during_treatment==1, 1, complication_stroke),
-         # labels for factors
-         complication_stroke = factor(complication_stroke, levels=0:1, labels=c('No','Yes')),
-         complication_seizure = factor(complication_seizure, levels=0:1, labels=c('No','Yes')),
-         complication_heart_failure = factor(complication_heart_failure, levels=0:1, labels=c('No','Yes')),
-    comorbidity_chronic_kidney_disease = factor(comorbidity_chronic_kidney_disease, levels=0:1, labels=c('No','Yes')),
-         comorbidity_severe_liver_disease = factor(comorbidity_severe_liver_disease, levels=0:1, labels=c('No','Yes')),
-         comorbidity_diabetes = factor(comorbidity_diabetes, levels=0:1, labels=c('No','Yes')),
-         comorbidity_hypertension = factor(comorbidity_hypertension, levels=0:1, labels=c('No','Yes')),
-         ecmo_cardiac_arrest_before = factor(ecmo_cardiac_arrest_before, levels=0:1, labels=c('No','Yes')),
-         ecmo_continuous_rpt_before = factor(ecmo_continuous_rpt_before, levels=0:1, labels=c('No','Yes')),
-         any_ecmo = as.numeric(ecmo_type!=''),
-         any_ecmo = factor(any_ecmo, levels=0:1, labels=c('No','Yes')))
-
-# b) daily
-daily = select(daily, pin, date_daily, ecmo, platelet_count, "aptt_aptr", "inr", alt_sgpt, "ast_sgot", 'bilirubin','blood_urea_nitrogen',
-               "lymphocyte_count", 'eotd_anticoagulants', "eotd_anticoagulants_type",
-               "pa_o2", "pa_co2",
-               "eotd_haemorrhagic_complication", "eotd_haemorrhagic_complication_source",
-               ) %>%
-  mutate(date_daily = ifelse(date_daily >= last_possible, NA, date_daily), # impossible date set to missing
-         date_daily = as.Date(date_daily, origin='1970-01-01')) 
-
-## inclusion/exclusion ## 
-patients = filter(patients,
-    !country %in% c('Australia','United Kingdom')) # remove countries that did not collect stroke data
-## exclusions
-# age, must be adults
-patients = filter(patients,
-    !is.na(age),
-    age >= 18) # 
-# no ICU date
-patients = filter(patients,
-    !is.na(date_icu))
-# missing sex (done below)
-
-# combined
-combined = full_join(patients, daily, by='pin')
-
-# change 'missing' to NA
-for_missing = select(patients, -pin, -any_ecmo, -stroke_type) %>% # remove ID; any_ecmo is never missing; stroke_type is a list variable
-  mutate(
-    sex = ifelse(sex=='Missing', NA,  sex),
-    ethnicity = ifelse(ethnicity=='Missing', NA, ethnicity),
-    outcome = ifelse(outcome %in% c('','unknown'), NA, outcome)) %>% # tidy up missing outcome
-  mutate_if(~is.character(.x), ~ifelse(.x=='', NA, .x)) # change '' to missing for character variables
-
-# reference dates for chloe
-for_chloe = filter(patients, complication_stroke=="Yes") %>%
-  select(pin, date_admission)
-write.csv(for_chloe, file='data/for_chloe.csv', quote=FALSE, row.names = FALSE)
-
-## exclusions
-# ... none yet
+source('1_ecmo_ich_data_prep.R') # prepares the data and runs exclusions
+library(visdat)
+library(summarytools)
+library(pander)
 ```
 
 This report uses the data from `r data_date$month` `r data_date$day`.
@@ -142,6 +34,28 @@ missing_gender = sum(is.na(for_missing$sex))
 ```
 
 The grey areas are the missing data. 
+
+###### Table of percentages of missing
+
+```{r}
+# added 18 March 2021
+missing_perc = mutate_all(for_missing, is.na) %>% # convert all to binary missing yes or no
+  pivot_longer(cols=everything()) %>% # long format
+  group_by(name, value) %>% # count missing
+  tally() %>%
+  group_by(name) %>%
+  mutate(p = round(prop.table(n)*100),
+         value = ifelse(value==TRUE, 'Missing', 'Not_missing')) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = value, values_from=p) %>%
+  arrange(Missing) %>%
+  select(-'Not_missing') #simplify
+ftab = flextable(missing_perc) %>%
+  theme_box() %>%
+  autofit()
+ftab
+```
 
 #### b) Missing data from daily records
 
@@ -163,17 +77,29 @@ vis_dat(for.missing)
 
 The grey areas are the missing data.
 
-#### Missing data and stroke
+###### Table of percentages of missing
 
-Do patients with a stroke have mortality data available? The table below shows whether the final outcome is known or unknown, and whether the stroke data is complete or missing. There is a lot of partially complete data. This uses the simple definition of stroke from the complications list. 
-
-```{r, results='asis'}
-to_table = mutate(patients, 
-          outcome = ifelse(outcome=='', 'Outcome=Unknown', 'Outcome=Known'),
-          stroke = ifelse(is.na(complication_stroke), 'Stroke=Missing', 'Stroke=Complete'))
-tab_complete = with(to_table, ctable(outcome, stroke, chisq=FALSE, round.digits=0, dnn=c(' ',''), prop='t', totals=FALSE))
-tab_complete
+```{r}
+# added 18 March 2021
+missing_perc = mutate_all(for.missing, is.na) %>% # convert all to binary missing yes or no
+  pivot_longer(cols=everything()) %>% # long format
+  group_by(name, value) %>% # count missing
+  tally() %>%
+  group_by(name) %>%
+  mutate(p = round(prop.table(n)*100),
+         value = ifelse(value==TRUE, 'Missing', 'Not_missing')) %>%
+  ungroup() %>%
+  select(-n) %>%
+  pivot_wider(names_from = value, values_from=p) %>%
+  arrange(Missing) %>%
+  select(-'Not_missing') #simplify
+ftab = flextable(missing_perc) %>%
+  theme_box() %>%
+  autofit()
+ftab
 ```
+
+
 
 
 # Descriptive statistics
@@ -196,6 +122,7 @@ tab_any
 r = sum(patients$any_ecmo=='Yes')
 n = nrow(patients)
 p = r/n
+z = qnorm(0.975)
 se = sqrt(p*(1-p)/n)
 lower = p - (z*se)
 upper = p + (z*se)
@@ -415,8 +342,6 @@ ftab = flextable(tab) %>%
   autofit()
 ftab
 ```
-
-Age is only available in 5 year intervals.
 
 ### Categorical variables
 
@@ -929,21 +854,38 @@ tab_stroke
 
 
 ```{r}
+# remove unknown and empty (March 2021)
+to_plot = filter(patients, complication_stroke=='Yes')
+to_remove = NULL
+for (k in 1:nrow(to_plot)){ # had to loop because of list
+  if(is.null(to_plot$stroke_type[[k]]) == TRUE){to_remove = c(to_remove, k)}
+  index = to_plot$stroke_type[[k]] %in% c('Other','Unknown')
+  if(any(index) == TRUE){
+    to_plot$stroke_type[[k]] = 'Unspecified'
+  }
+}
+to_plot = to_plot[1:nrow(to_plot) %in% to_remove==FALSE, ]
 # add ggupset
-cplot = ggplot(filter(patients, complication_stroke=='Yes'), aes(x = stroke_type)) +
+cplot = ggplot(data=to_plot, aes(x = stroke_type)) +
     geom_bar(aes(y=..count..), fill='seagreen') +
     theme_bw() +
     xlab("") +
     ylab("Number of patients") +
     scale_x_upset( )+
+  scale_y_continuous(breaks=seq(0,12,2))+ # avoid fractions in breaks
     g.theme+
   theme(plot.margin = margin(t = 5, r = 0, b = 0, l = 110, unit = "pt"))
 cplot
+jpeg('figures/stroke/stroke_upset.jpg', width=5, height=4.5, units='in', res=300, quality=100)
+print(cplot)
+invisible(dev.off())
 ```
 
 This is a new variable which was added in August 2020. Up to two options for the stroke type variable could be ticked. The plot is just for the `r sum(patients$complication_stroke=='Yes', na.rm=TRUE)` patients with a stroke complication.
 
-The third most common response is missing stroke type, which reflects the fact that the data is being added retrospectively. The most common response with complete data is "Intraparenchymal haemorrhage". 
+Patients with no stroke type have been excluded from this plot.
+
+The second most common response is missing stroke type, which reflects the fact that the data is being added retrospectively. The most common response with complete data is "Intraparenchymal haemorrhage". 
 
 ## Association between a cannula in the internal jugular vein and stroke/ICH/death
 
