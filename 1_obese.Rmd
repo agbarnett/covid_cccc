@@ -1,0 +1,1163 @@
+---
+title: "COVID and obesity in ECMO patients"
+author: "Adrian Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  word_document
+link-citations: yes
+bibliography: bibs.bib
+---
+  
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, error=FALSE, comment='', dpi=400)
+options(width=1000) # Wide pages
+options(scipen=999) # avoid scientific presentation
+
+## libraries and functions
+library(mice) # for making imputed data
+library(mitools) # for summarising imputations
+library(diagram)
+library(dplyr)
+options(dplyr.summarise.inform = FALSE)
+library(tidyr)
+#library(mstate)
+library(stringr)
+library(flextable)
+library(broom)
+library(cmprsk)
+library(survminer) # for nice plots of competing risks
+source('99_functions.R')
+# for captions:
+library(captioner)
+table_nums <- captioner(prefix = "Table", levels=2, type = c("n", "c")) # number and character
+figure_nums <- captioner(prefix = "Figure", levels=2, type = c("n", "c"))
+library(diagram) # for state diagrams
+library("INLA") # for bayesian models
+library(brinla) # for residuals from INLA survival models
+
+# maximum day for plots and estimates
+censor_day = 90
+
+## Questions:
+# "The key question in my mind was does morbid obesity impact survival in patients on ecmo with covid 19."
+# How do obese people do on VV ECMO?
+
+## prepare CCC set (with id, from, to, entry, exit; from and to are state numbers)
+load('data/COVID_Data_obese.RData') # 0_read_data.R
+
+## Mechanically Ventilated patients (used later)
+mv_patients = filter(patients, 
+                  age >= 18, # adults only
+                  sex %in% c('Female', 'Male'),
+                  !is.na(date_icu), # must be in ICU
+                  !is.na(date_mechanical_ventilation)) # must have started MV
+
+## apply inclusions for the obese patients
+patients = filter(patients, 
+                  age >= 18, # adults only
+                  ecmo_type == 'Venous-Venous', # just VV ECMO
+      sex %in% c('Female', 'Male'),
+      !is.na(date_icu), # must be in ICU
+      !is.na(date_ecmo)) # must have an ECMO start date
+n_patients = nrow(patients)
+
+# create BMI category using threshold from Jeff
+patients = mutate(patients, 
+        # if no final outcome then unknown:
+        outcome = ifelse(outcome=='', 'Unknown', outcome), 
+        # if no death date then switch to unknown:
+        outcome = ifelse(outcome=='Death' & is.na(date_death), 'Unknown', outcome),
+        # create apache category
+        apache_cat = case_when(
+          apache_ii <= median(patients$apache_ii, na.rm=TRUE) ~ "Low",
+          apache_ii > median(patients$apache_ii, na.rm=TRUE) ~ "High",
+          is.na(apache_ii) ~ "Missing"
+        ),
+        bmi_cat = case_when(
+          bmi <= 35 ~ "Low (<= 35)",
+          bmi > 35 ~ "High (> 35)",
+          is.na(bmi) ~ "Missing"
+        ))
+
+```
+
+This report uses the data available on `r data_date$month` `r data_date$day`.
+
+```{r, include=FALSE}
+### work out patients to exclude because of missing data in their dates ###
+
+### start by generating transitions with no intermediate state ###
+trans.data = time_transitions_no_intermediate(indata = patients, 
+          start_state = 'date_ecmo', # starting date/state
+          discharge_date = 'date_hospital_discharge', # ICU (date_discharge) or hospital discharge (date_hospital_discharge)
+          check = TRUE, 
+          censor_day = censor_day) %>%
+  rename('entry' = 'start', # use these names to suit mstate function below
+       'exit' = 'end')
+# check transfers, look fine, no need to apply transfers
+# filter(trans.data, !is.na(date_transfer)) %>% select(pin, date_ecmo, date_discharge, date_transfer, last_date)
+# now remove excluded patients with too much missing date data
+excluded = patients$pin[patients$pin %in% trans.data$pin ==FALSE]
+patients = filter(patients, !pin %in% excluded)
+# check exclusions, all have something badly wrong with date
+#f = filter(patients, pin==excluded[1]) %>% select(pin, date_ecmo, date_discharge, date_death, date_hospital_discharge, last_date, date_transfer)
+```
+
+```{r, include=FALSE}
+# repeat above for MV patients
+trans.data.mv = time_transitions_string(
+  indata = mv_patients,
+        dates = c('date_mechanical_ventilation','date_ecmo','date_transfer','date_hospital_discharge','date_death'),
+        int_state = 'date_ecmo', # intermediate
+       start_state = 'date_mechanical_ventilation', # starting date/state
+         discharge_date = 'date_hospital_discharge', # hospital discharge 
+  check = TRUE, 
+         censor_day = censor_day)
+# transfers are censored
+trans.data.mv = mutate(trans.data.mv,
+    to = ifelse(to=='date_transfer','censored', to)) %>% # transfer is the same as censored
+  filter(from == 'date_mechanical_ventilation') # just MV patients
+# patients with too little data:
+mv_excluded = mv_patients$pin[mv_patients$pin %in% trans.data.mv$pin ==FALSE]
+# now remove from patients
+mv_patients = filter(mv_patients, !pin %in% mv_excluded)
+```
+
+We included adult patients (aged 18+) who experienced Venous-Venous ECMO during their stay. 
+
+We excluded patients with insufficient information on the dates of ECMO, discharge and death. The total number of patients excluded for this reason was `r length(excluded)`.
+
+The total number of patients is `r n_patients`. The data come from `r length(unique(patients$site_name))` sites.
+
+```{r, include=FALSE}
+first_date = format(min(patients$date_admission), '%d-%b-%Y')
+last_date = format(max(patients$date_admission), '%d-%b-%Y')
+```
+
+The first patient was admitted on `r first_date` and the last patient on `r last_date`.
+
+# Missing data
+
+For some descriptive statistics we split BMI into high and low using a threshold of 35 kg/m2. Because of the missing data we keep a third category of missing. So the categorical BMI variable has three categories of low, high and missing. In the survival analyses we impute missing BMI (see below).
+
+For SOFA and APACHE II score we split these variables into the three categories of:
+
+* Low, below median
+* High, above median
+* Missing
+
+The table below is the cross-tabulation of categorical BMI and APACHE II.
+
+```{r}
+tab = group_by(patients, bmi_cat, apache_cat) %>%
+  summarise(count = n()) %>% 
+  ungroup() %>%
+  tidyr::spread(apache_cat, count)  %>%
+  rename('BMI category' = 'bmi_cat')
+# nice table
+typology = data.frame(col_keys=c('bmi_cat','High','Low','Missing'),
+                      colA = c('','APACHE','APACHE','APACHE'),
+                      colB = c('BMI','High','Low','Missing'))
+ftab = flextable(tab) %>%
+   set_header_df(mapping = typology, key = "col_keys" ) %>%
+   merge_h(part = "header", i=1) %>%
+   theme_box() %>%
+   align(align='center', part='all') %>%
+  autofit()
+table_nums(name="cross_tab", "Cross-tabulation of the categorical BMI and APACHE variables") # title
+ftab
+```
+
+# Summary tables and plots
+
+#### a) Continuous variables
+
+```{r}
+#
+cont_vars = c('age','bmi','sofa','apache_ii')
+#
+tab = select(patients, pin, bmi_cat, all_of(cont_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin, -bmi_cat) %>%
+  group_by(Variable, bmi_cat) %>%
+  summarise(Non_missing = sum(!is.na(Value)),
+            Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, bmi_cat, Non_missing, Missing, Median, IQR)  %>%
+  rename('BMI category' = 'bmi_cat')
+#  pivot_wider(names_from = bmi_cat, values_from = c(Non_missing, Missing, Median, IQR)) 
+#, names_glue = "{bmi_cat}_{.value}", names_sort=FALSE
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  merge_v(j=1) %>%
+  autofit()
+table_nums(name="summary_cont", "Summary statistics for continuous variables") # title
+ftab
+```
+
+IQR = inter-quartile range.
+
+```{r, fig.width=6}
+# boxplots
+to_plot = select(patients, pin, bmi_cat, cont_vars) %>%
+  pivot_longer(!c(pin, bmi_cat), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value),
+         bmi_cat != 'Missing') # do not include missing in plot
+bplot = ggplot(data=to_plot, aes(x=value, col=bmi_cat))+
+  geom_boxplot()+
+  xlab('')+
+  scale_color_manual('BMI category', values=c('goldenrod2','darkseagreen3'))+
+  scale_y_continuous(breaks=NULL)+
+  facet_wrap(~variable, scales='free')+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="boxplots", "Boxplots of continuous variables by Body Mass Index category") # title
+bplot
+```
+
+#### b) Categorical variables
+
+```{r}
+# dropped ,'comorbidity_obesity'
+cat_vars = c('sex','country','ethnicity','bmi_cat','apache_cat')
+#
+tab = select(patients, pin, bmi_cat, all_of(cat_vars)) %>%
+  tidyr::gather(key='Variable', value='Value', -pin, -bmi_cat) %>%
+  group_by(Variable, bmi_cat, Value) %>%
+  tally() %>%
+  group_by(Variable, bmi_cat) %>%
+  mutate(percent = roundz(prop.table(n)*100,0)) %>% # calculate percent
+  arrange(Variable, bmi_cat, -n) %>% # arrange from high to low within variables
+  mutate(cell = paste(n, ' (', percent, ')', sep='')) %>%
+  select(-n, -percent) %>%
+  pivot_wider(values_from = cell, names_from=bmi_cat, values_fill='0')
+ftab = flextable(tab) %>%
+  merge_v(j = c("Variable") ) %>% # merge rows
+  theme_box() %>%
+  autofit()
+table_nums(name="summary_cat", "Summary statistics for categorical variables") # title
+ftab
+```
+
+#### c) Co-morbidities by low / high BMI
+
+```{r}
+to_table = select(patients, pin, bmi_cat, starts_with('comorb')) %>%
+  select(-comorbidity_other_risk_factors, -comorbidity_hba1c_units, -comorbidity_diabetes_mellitus_hba1c, -comorbidity_immuno, -comorbidity_aids_hiv_cd4_count) %>% # remove characters or those with just missing
+  pivot_longer(!c(pin,bmi_cat), names_to='Comorbidity') %>%
+  mutate(Value = case_when(
+    value == 0 ~ 'No',
+    value == 1 ~ 'Yes',
+    is.na(value) == TRUE ~ 'Missing'
+  )) %>%
+  group_by(Comorbidity, bmi_cat, Value) %>%
+  tally() %>%
+  group_by(Comorbidity, bmi_cat) %>%
+  mutate(percent = round(prop.table(n)*100)) %>%
+  ungroup() %>%
+  mutate(Comorbidity = str_remove_all(Comorbidity, pattern='^comorbidity_'),
+         Comorbidity = str_replace_all(Comorbidity, pattern='_', replacement=' '),
+         cell = paste(n, ' (', percent, ')', sep='')) %>%
+  select(-n, -percent) %>%
+  pivot_wider(values_from = cell, names_from=bmi_cat, values_fill='0')
+ftab = flextable(to_table) %>%
+  merge_v(j = c("Comorbidity") ) %>% # merge rows
+  theme_box() %>%
+  autofit()
+table_nums(name="comorb", "Counts and percentages of comorbidities by BMI category") # title
+ftab
+```
+
+#### d) Ventilation settings
+
+On the day of ECMO or the day after for those with missing data on the day of ECMO.
+
+```{r}
+#FiO2
+#PEEP, cm H2O
+#Static compliance, mL/cm H2O
+#PaO2/FiO2
+#PCO2
+# make reduced daily data
+daily_vars = c('pa_o2_fi_o2','pa_o2','pa_co2','p_h','compliance_respiratory_system')
+this_daily = select(daily, pin, date_daily, all_of(daily_vars))
+# show settings on date of ECMO initiation or day after
+date_e = select(patients, pin, bmi_cat, date_ecmo) # day of ecmo
+date_e1 = mutate(date_e, date_ecmo = date_ecmo+1) # day after
+all_dates = bind_rows(date_e, date_e1, .id='day') # bind two dates
+# merge dates with daily
+full_data = left_join(all_dates, this_daily, by=c('pin'='pin', 'date_ecmo'='date_daily')) %>% 
+  pivot_longer(-c(pin, date_ecmo, bmi_cat, day), values_to='Value', names_to='Variable') %>%
+  filter(!is.na(Value)) %>%
+  group_by(pin, Variable) %>%
+  arrange(pin, Variable, day) %>% # sort by date
+  slice(1) # take first non-missing per patient and variable
+# now do summary stats
+tab = filter(full_data, Variable !='p_h') %>%
+  group_by(Variable, bmi_cat) %>%
+  summarise(N = sum(!is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, bmi_cat, N, Median, IQR)  %>%
+  rename('BMI category' = 'bmi_cat')
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  merge_v(j=1) %>%
+  autofit()
+table_nums(name="settings", "Ventilation settings") # title
+ftab
+
+## just ph with different dp
+tab = filter(full_data, Variable =='p_h') %>%
+  group_by(Variable, bmi_cat) %>%
+  summarise(N = sum(!is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),2),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),2),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),2),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, bmi_cat, N, Median, IQR)  %>%
+  rename('BMI category' = 'bmi_cat')
+ftab = flextable(tab) %>%
+  theme_box() %>%
+  merge_v(j=1) %>%
+  autofit()
+table_nums(name="settings2", "Ventilation settings (ph)") # title
+ftab
+
+```
+
+
+#### e) Time variables by low / high BMI
+
+```{r, time_table}
+# create time variables
+patients = mutate(patients,
+                  # calculate end dates
+      date_end = ifelse(is.na(date_hospital_discharge)==FALSE, date_hospital_discharge, date_death), # end date of death or discharge
+      date_end = as.Date(date_end, origin='1970-01-01'),
+      #
+      date_end_icu = ifelse(is.na(date_discharge)==FALSE, date_discharge, date_death), # end date of death or discharge
+      date_end_icu = as.Date(date_end_icu, origin='1970-01-01'),
+      #
+      days_hosp = as.numeric(date_end - date_admission) + 0.5,
+      days_icu = as.numeric(date_end_icu - date_icu) + 0.5,
+      days_symptoms_hosp = as.numeric(date_admission - date_first_symptom) +0.5, 
+      #
+      duration_ecmo = as.numeric(date_ecmo_discontinued - date_ecmo) + 0.5,
+      duration_mv = as.numeric(date_mech_vent_discontinued - date_mechanical_ventilation +0.5),
+# new (Jan 2021)
+      days_admission_mv = as.numeric(date_mechanical_ventilation - date_admission) + 0.5,
+days_admission_ecmo = as.numeric(date_ecmo - date_admission) + 0.5)
+
+#
+time_vars = c('days_symptoms_hosp','days_hosp','days_icu','duration_ecmo','duration_mv','days_admission_mv','days_admission_ecmo')
+#
+stats = select(patients, pin, bmi_cat, all_of(time_vars)) %>%
+   pivot_longer(!c(pin, bmi_cat), names_to='Variable', values_to='Value') %>%
+  group_by(Variable, bmi_cat) %>%
+  summarise(Non_missing = sum(!is.na(Value)),
+            Missing = sum(is.na(Value)),
+            Median = roundz(median(Value, na.rm=TRUE),0),
+            Q1 = roundz(quantile(Value, probs=0.25, na.rm=TRUE),0),
+            Q3 = roundz(quantile(Value, probs=0.75, na.rm=TRUE),0),
+            IQR = paste(Q1 , ' to ', Q3, sep='')) %>%
+  select(Variable, bmi_cat, Non_missing, Missing, Median, IQR) %>%
+  mutate(Variable = case_when(
+    Variable=='duration_ecmo'~ 'Duration of ECMO',
+    Variable=='duration_mv'~ 'Duration of MV', 
+    Variable=='days_hosp'~ 'Days in hospital', 
+    Variable=='days_icu'~ 'Days in ICU',
+    Variable=='days_admission_mv'~ 'Days from hospital admission to MV', 
+    Variable=='days_admission_ecmo'~ 'Days from hospital admission to ECMO', 
+    Variable=='days_symptoms_hosp'~ 'Days between symptoms and hospital admission'
+#    TRUE ~ as.character(x)
+    )) %>%
+  rename('BMI category' = 'bmi_cat')
+ftab = flextable(stats) %>%
+  theme_box() %>%
+  fontsize(size=10, part='all') %>%
+  merge_v(j=1) %>%
+  autofit()
+table_nums(name="summary_time", "Summary statistics for time variables (in days)") # title
+ftab
+```
+
+
+#### f) ECMO times for zero vs non-zero days
+
+```{r, ecmo_days_plot}
+dplot = ggplot(data=patients, aes(x=days_admission_ecmo))+
+  geom_bar(fill='darkseagreen2', col='grey', width=1)+
+  xlab('Days from hospital admission to ECMO')+
+  ylab('Frequency')+
+  scale_x_continuous(limits=c(-7,21))+ # remove outliers
+  theme_bw()
+dplot
+```
+
+# Imputing missing BMI
+
+We randomly imputed the small number of missing BMI (number missing = `r sum(is.na(trans.data$bmi))`).
+We used Multivariate Imputation by Chained Equations (MICE) to create five imputed data sets. BMI was imputed using the variables: country, ethnicity, height, weight, age, sex, APACHE II and SOFA.
+
+```{r, include=FALSE}
+# 
+imputerVars <- c("country","ethnicity","height","weight","age","sex",'apache_ii','sofa') # variables used for imputation of BMI (some also have missing)
+vars_to_keep = c('pin','site_name','calendar_time','bmi','bmi_cat','apache_cat','exit','from','to') # other variables not used for imputation, but that need to be kept
+# get data ready for model
+trans.data = mutate(trans.data, 
+                     age = (age-50)/10, # scaled
+                     bmi = (bmi-30)/5, # scaled
+                     calendar_time = (as.numeric(date_ecmo)-18389)/31, # median = 2020-05-07
+                     sex = as.numeric(sex=='Male')) %>%
+  select(all_of(vars_to_keep), all_of(imputerVars))
+  
+# flag what variables to use in imputation (exclude exit/to from imputation, but keep them in the data); see https://rpubs.com/kaz_yos/mice-exclude
+allVars <- names(trans.data)
+predictorMatrix <- matrix(0, ncol = length(allVars), nrow = length(allVars))
+rownames(predictorMatrix) <- allVars
+colnames(predictorMatrix) <- allVars
+## Keep variables that actually exist in dataset
+imputerVars <- intersect(unique(imputerVars), allVars)
+imputerMatrix <- predictorMatrix
+imputerMatrix[,imputerVars] <- 1
+#
+missVars <- names(trans.data)[colSums(is.na(trans.data)) > 0]
+imputedOnlyVars <- c("bmi") # could add apache, but too much missing?
+## Imputers that have missingness must be imputed.
+imputedVars <- intersect(unique(c(imputedOnlyVars, imputerVars)), missVars)
+imputedMatrix <- predictorMatrix
+imputedMatrix[imputedVars,] <- 1
+#
+predictorMatrix <- imputerMatrix * imputedMatrix
+## Diagonals must be zeros (a variable cannot impute itself)
+diag(predictorMatrix) <- 0
+predictorMatrix
+
+# imputation using MICE
+N.impute = 5
+imputed_data = mice(trans.data, m=N.impute, seed=4002, printFlag=FALSE, predictorMatrix = predictorMatrix)
+```
+
+```{r, include=FALSE}
+# repeat imputation for MV data
+# get data ready for model
+trans.data.mv = mutate(trans.data.mv, 
+                     age = (age-50)/10, # scaled
+                     bmi = (bmi-30)/5, # scaled
+                     calendar_time = (as.numeric(date_ecmo)-18389)/31, # median = 2020-05-07
+                     sex = as.numeric(sex=='Male')) %>%
+  select(all_of(vars_to_keep), all_of(imputerVars))
+  
+# flag what variables to use in imputation (exclude exit/to from imputation, but keep them in the data); see https://rpubs.com/kaz_yos/mice-exclude
+allVars <- names(trans.data.mv)
+predictorMatrix <- matrix(0, ncol = length(allVars), nrow = length(allVars))
+rownames(predictorMatrix) <- allVars
+colnames(predictorMatrix) <- allVars
+## Keep variables that actually exist in dataset
+imputerVars <- intersect(unique(imputerVars), allVars)
+imputerMatrix <- predictorMatrix
+imputerMatrix[,imputerVars] <- 1
+#
+missVars <- names(trans.data.mv)[colSums(is.na(trans.data.mv)) > 0]
+imputedOnlyVars <- c("bmi") # could add apache, but too much missing?
+## Imputers that have missingness must be imputed.
+imputedVars <- intersect(unique(c(imputedOnlyVars, imputerVars)), missVars)
+imputedMatrix <- predictorMatrix
+imputedMatrix[imputedVars,] <- 1
+#
+predictorMatrix <- imputerMatrix * imputedMatrix
+## Diagonals must be zeros (a variable cannot impute itself)
+diag(predictorMatrix) <- 0
+predictorMatrix
+
+# imputation using MICE
+imputed_data_mv = mice(trans.data.mv, m=N.impute, seed=4005, printFlag=FALSE, predictorMatrix = predictorMatrix)
+```
+
+
+# Survival models
+
+## Model diagram
+
+The figure below shows the three states in the multi-state survival model. We followed patients from the date then began on ECMO. Death and discharge are competing risks. Patients were censored if they did not have a date of death or discharge. We censored them using their last date of daily data or the last day data were collected (`r paste(data_date$day, data_date$month, sep=' ')`).
+
+```{r, fig.width=4, fig.height=3}
+states = c('ECMO','Death','Discharge\nfrom hospital')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  3,1
+), byrow = TRUE, ncol=2)
+figure_nums(name="model_diagram", "The three states in the model and the possible movements between states", level=1) # title, increase title number
+multistate_diagram(states=states, links = M, pos = c(1, 2), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
+jpeg(filename='figures/obese/state_diagram.jpg', width=3, height=3, units='in', res=400, quality = 100)
+multistate_diagram(states=states, links = M, pos = c(1, 2), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
+invisible(dev.off())
+```
+
+### Table of transitions between states
+
+This table below shows the transitions (movements) between the states.
+
+```{r}
+tab = as.data.frame(with(trans.data, table(from, to))) %>%
+  mutate(from = case_when(
+    from==1 ~ 'ECMO')
+  ) %>%
+  tidyr::spread(to, Freq)
+# table header
+table_header <- data.frame(
+  col_keys = c('from','0', '2','3'),
+  h1 = c('', rep("State moved to", 3)),
+  h2 = c('State moved from', 'Censored','Discharge','Death'),
+  stringsAsFactors = FALSE )
+ftab = flextable(tab) %>%
+  set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  align(align='center', part='all') %>% # centre text
+  theme_box() %>%
+  autofit() 
+table_nums(name="transitions", "Transition numbers between states", level=1) # title, increase level number
+ftab
+```
+
+## Cumulative incidence curves
+
+```{r, fig.width=7}
+# cumulative incidence
+trans.data = mutate(trans.data,
+                 bmi_cat_num = as.numeric(as.factor(bmi_cat))) # need simply category for cuminc
+cum_inc = with(trans.data, cuminc(ftime=exit, fstatus=to, group=bmi_cat_num, cencode='0'))
+g = ggcompetingrisks(cum_inc)
+# make new plot
+bmi_labels = c("High (> 35)","Low (<= 35)" ,"Missing")
+for_plot = mutate(g$data, 
+                  event_factor = factor(event, levels=2:3, labels=c('Discharge','Death')),
+                 bmi_cat_factor = factor(group, levels=1:3, labels=bmi_labels)) %>%
+  filter(bmi_cat_factor != "Missing") # remove missing
+cplot = ggplot(data=for_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_step(size=1.05)+
+  xlab('Days since ECMO started')+
+  ylab('Cumulative probability')+
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_colour_manual(name="Outcome:", values=c('dodgerblue','indianred1'), labels=c("Discharge",'Death')) +  
+  facet_wrap(~bmi_cat_factor)+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="cumunc", 'Cumulative probabilities over time of discharge and death. The panels show the categories of BMI.') # title
+cplot
+jpeg(filename='figures/obese/cumulative_risks.jpg', width=6, height=4, units='in', res=400, quality = 100)
+print(cplot)
+invisible(dev.off())
+```
+
+There is some evidence that those with a missing BMI are at higher risk of death, although the numbers are small. One possibility is that the sickest patients also have the most amount of missing data.
+
+#### Alternative plot of cumulative risks
+
+This plot uses the same curves as above but presented in an alternative grouping.
+
+```{r, fig.width=7}
+aplot = ggplot(data=for_plot, aes(x=time, y=est, col=factor(bmi_cat_factor)))+
+  geom_step(size=1.05)+
+  xlab('Days since ECMO started')+
+  ylab('Cumulative probability')+
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_colour_manual(name="BMI:", values=c(c("#8470FF", "#4EEE94", "#CCCCCC")), labels=bmi_labels) +  
+  facet_wrap(~event_factor)+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="cumunc_alternative", 'Cumulative probabilities over time of discharge and death. The panels are death and discharge.') # title
+aplot
+jpeg(filename='figures/obese/cumulative_risks_alternative.jpg', width=6, height=4, units='in', res=400, quality = 100)
+print(aplot)
+invisible(dev.off())
+```
+
+When looking at the risk of death, the cumulative curve for high BMI is generally above the curve for low BMI.
+
+## Cumulative survival models
+
+The survival models in this section focus on the patients' final (or cumulative) outcome of death and discharge, whereas the Cox models (below) examine the instantaneous hazard of experiencing death or discharge. 
+
+The table below shows the cumulative hazard ratios and 95% confidence intervals for the competing outcomes death and discharge. The variables in the model were age, sex, calendar time, APACHE II and BMI. 
+
+Here we examine BMI as a continuous risk, so each increase in BMI is important. The plots above categorise BMI into low and high, but keeping BMI as a continuous variable increases our statistical power to find a difference in risk.
+
+Separate models were run for each of the five imputed data sets and then combined. The results therefore hopefully account for the small amount of missing data for BMI.
+
+```{r, include=FALSE}
+## run models with imputed data
+death_coef = disch_coef = death_vcov = disch_vcov = NULL
+for (k in 1:N.impute){ # loop through imputed data
+# design matrix (because of categorical variables):
+  M = with(complete(imputed_data, k), model.matrix(exit ~ age + calendar_time + sex+ bmi+ apache_cat)) # complete data from MICE imputation
+  cov1 = as.matrix(M[,-1]) # exclude intercept
+  # death model
+  cum_rr_death = with(complete(imputed_data, k), crr(ftime=exit, fstatus=to==3, cov1=cov1, cencode='0', maxiter = 100))
+# discharge model
+  cum_rr_discharge = with(complete(imputed_data, k), crr(ftime=exit, fstatus=to==2, cov1=cov1, cencode='0', maxiter = 100))
+  # add estimates
+  death_coef[[k]] = cum_rr_death$coef
+  death_vcov[[k]] = cum_rr_death$var
+  disch_coef[[k]] = cum_rr_discharge$coef
+  disch_vcov[[k]] = cum_rr_discharge$var
+}
+# get combined estimates across all imputations
+death_crr = summary(MIcombine(death_coef, death_vcov)) %>% mutate(Outcome = 'Death' )
+discharge_crr = summary(MIcombine(disch_coef, disch_vcov)) %>% mutate(Outcome = 'Discharge' )
+to_table = bind_rows(death_crr, discharge_crr) %>% 
+  mutate(HR = roundz(exp(results), 2),
+         lower = roundz(exp(`(lower`), 2),
+         upper = roundz(exp(`upper)`), 2),
+         CI = paste(lower, ' to ', upper, sep='')) %>%
+  select(Outcome, HR, CI) 
+```
+
+```{r}
+ftable = bind_cols(filter(to_table, Outcome=='Death') %>% select(-Outcome),
+                   filter(to_table, Outcome=='Discharge') %>% select(-Outcome))
+names(ftable) = c('HR1','CI1','HR2','CI2')
+ftable = mutate(ftable, 
+                Variable = names(cum_rr_discharge$coef),
+                Variable = case_when( # nice rename
+                  Variable == 'age'~ 'Age (+10 years)',
+                  Variable == 'sex'~ 'Sex = Male',
+                  Variable == 'calendar_time'~ 'Time (+1 month)',
+                  Variable == 'apache_catMissing'~ 'APACHE = missing',
+                  Variable == 'apache_catLow'~ 'APACHE = low',
+                  Variable == 'bmi'~ 'BMI (+5 kg/m2)',
+                  Variable == 'bmi_catMissing'~ 'BMI = missing',
+                  Variable == 'bmi_catLow (<= 35)'~ 'BMI = low (<=35)',
+                  TRUE ~ as.character(Variable)
+                )) %>%
+  select('Variable', everything()) %>% # move Variable first
+  flextable() %>%
+  add_header('Variable'='', 'HR1' = 'Death', 'CI1' = 'Death', 'HR2' = 'Discharge', 'CI2' = 'Discharge') %>%
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  theme_box() %>% # nice theme
+  align(align='center', part='all') %>% # centre text
+  autofit() 
+table_nums(name="crr_hazards", "Hazard ratios and 95% confidence intervals using a cumulative probability regression model")
+ftable
+```
+
+Older age is associated with an increase in the risk of death and decrease in the risk of discharge.
+
+A higher BMI is associated with an increased risk of death.
+
+## Cox survival models
+
+We used semi-parametric Cox models to model the survival times to death and discharge. These models examine the instantaneous risk of death and discharge. These survival models are commonly used in the medical literature.
+
+As an alternative to the semi-parametric Cox model we tried parametric exponential and Weibull models, but these did not converge, indicating that they were not a good choice for this analysis.
+
+The Cox survival models were fitted using a Bayesian paradigm using the "INLA" package. Five models were fitted using the five imputed datasets and combined using Bayesian model averaging.
+
+### Looking for a threshold for BMI
+
+We examine if there is BMI above which the risk of death or discharge changes. We use the deviance information criteria (DIC) to select the best model. The lower the DIC, the better the model. There are five dots per threshold below as we fitted each model to the five imputed data sets.
+
+```{r, include=FALSE}
+# using INLA to fit Bayesian model
+# random intercept for site
+# looking for a threshold for BMI
+knots_unscaled = seq(26,44,2) # BMI knots on original scale ...
+knots_scaled = (knots_unscaled - 30)/5 # ... standardised
+knots_to_try = c(NA, knots_scaled) #  NA for no knots
+
+previous = length(dir('results', pattern='obese_inla_cox')) > 0
+if(previous == FALSE){# if there are no results
+  source('1_inla_models_obese.R')
+}
+if(previous == TRUE){ # if there are already results
+  load('results/obese_inla_cox.RData')
+}
+```
+
+```{r, fig.width=7}
+# add 'better model' as text
+DIC_plot = mutate(DIC,
+                  outcome = ifelse(event==2, 'Discharge','Death'),
+             threshold = as.numeric(!is.na(knot)),
+             threshold = factor(threshold, levels=0:1, labels=c('No','Yes')),
+             knot = ifelse(threshold=='No', -0.8, knot), # set missing to minimum cut
+             knot_back = (knot*5)+30) # back to original scale
+#
+dplot = ggplot(data=DIC_plot, aes(x=knot_back, y=DIC, col=threshold))+
+  scale_color_manual('Threshold', values=c('salmon2','seagreen3'))+
+  geom_point(size=4)+
+  scale_x_continuous(breaks=seq(25,45,5))+
+  ylab('DIC')+
+  xlab('BMI threshold')+
+  facet_wrap(~outcome, scales='free_y', ncol=1)+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="dic", "Model fit for a range of thresholds. The model with the best fit has the lowest DIC.")
+dplot
+```
+
+The plot shows that the best model for both death and discharge is that without a threshold (the orange dots have the smallest DIC). This indicates that there may not be a "safe" BMI, or a BMI beyond which risk greatly increases. From now on we show the results without any BMI threshold.
+
+The models for death show that a low threshold may be equally good as a model with no threshold. However, we prefer the model with no threshold on the principle of parsimony.
+
+### Estimated risks of death and discharge
+
+The table below shows the hazard ratios and 95% credible intervals for the competing outcomes death and discharge. The variables in the model were age, sex, calendar time, APACHE II and BMI. The models used a random intercept to account for differences between sites.
+
+```{r}
+to_table = filter(all_ests, is.na(knot)) %>% # best model has no knot 
+  filter(!str_detect(string=vars, pattern='(Intercept)')) %>%
+  mutate(
+    outcome = ifelse(event==2, 'Discharge','Death'),
+    Variable = case_when(
+    vars=='sex' ~ 'Sex = male',
+    vars=='age' ~ 'Age (+10 years)',
+    vars == 'apache_catMissing'~ 'APACHE = missing',
+    vars == 'apache_catLow'~ 'APACHE = low',
+    vars=='calendar_time' ~ 'Time (+1 month)',
+    vars=='bmi' ~ 'BMI (+5 kg/m2)'
+  ), 
+  mean = exp(mean), # make hazard ratios
+  lower = exp(lower),
+  upper = exp(upper)
+  ) %>%
+  select(outcome, Variable, mean, lower, upper)
+ftab = flextable(to_table) %>%
+  theme_box() %>%
+  colformat_num(j=3:5, digits=2) %>%
+  autofit()
+table_nums(name="cox_model", "Hazard ratios and 95% credible intervals for the Cox model") # 
+ftab
+```
+
+Older age is associated with a decrease in the hazard of discharge and increase in the hazard of death. Higher BMI is associated with an increase in the hazard of death.
+
+# Non-ECMO patients
+
+Here we examine the outcomes of patients on mechanical ventilation. The aim is to provide a comparison to the ECMO patients in terms of the key question of the effect of BMI. The patients must have been started on mechanical ventilation.
+
+The total number of patients is `r format(nrow(mv_patients),big.mark=',')`. The data come from `r length(unique(mv_patients$site_name))` sites.
+
+## Model diagram
+
+The figure below shows the four states in the multi-state survival model. In this model we  examine the time to the first event after starting mechanical ventilation, the three events are starting ECMO, death or discharge. We do not examine patients' times after starting ECMO because that is considered above.
+
+```{r, fig.width=4, fig.height=3}
+states = c('MV start','ECMO start','Death','Discharge\nfrom hospital')
+# Matrix of joins between states:
+M = matrix(data=c(
+  2,1,
+  3,1,
+  4,1
+), byrow = TRUE, ncol=2)
+figure_nums(name="model_diagram_mv", "The four states in the model and the possible movements between states", level=1) # title, increase title number
+multistate_diagram(states=states, links = M, pos = c(1, 3), arr.pos=0.65, box.size = 0.14) # see 99_functions.R
+```
+
+### Table of transitions between states
+
+This table below shows the transitions (movements) between the states.
+
+```{r}
+tab = as.data.frame(with(trans.data.mv, table(from, to))) %>%
+  mutate(from = case_when(
+    from=='date_mechanical_ventilation' ~ 'MV start'),
+    to = case_when(
+    to=='date_int_state_start' ~ 'ECMO',
+    to=='death' ~ 'Death',
+    to=='discharge' ~ 'Discharge',
+    to=='censored' ~ 'Censored')
+  ) %>%
+  tidyr::spread(to, Freq)
+# table header
+table_header <- data.frame(
+  col_keys = c('from','Censored', 'ECMO','Discharge','Death'),
+  h1 = c('', rep("State moved to", 4)),
+  h2 = c('State moved from', 'Censored','ECMO','Discharge','Death'),
+  stringsAsFactors = FALSE )
+ftab = flextable(tab) %>%
+  set_header_df(mapping = table_header, key = "col_keys" ) %>% # add header
+  merge_h(i=1, part = "header") %>% # merge "To" column headers
+  align(align='center', part='all') %>% # centre text
+  theme_box() %>%
+  autofit() 
+table_nums(name="transitions_mv", "Transition numbers between states for the mechanical ventilation model", level=1) # title, increase level number
+ftab
+```
+
+### Cumulative risks for MV patients
+
+```{r, fig.width=7}
+# cumulative incidence
+trans.data.mv = mutate(trans.data.mv,
+                    bmi_cat_num = as.numeric(as.factor(bmi_cat))) # need simply category for cuminc
+cum_inc = with(trans.data.mv, cuminc(ftime=exit, fstatus=to, group=bmi_cat_num, cencode='censored'))
+g = ggcompetingrisks(cum_inc)
+# make new plot
+bmi_labels = c("High (> 35)","Low (<= 35)" ,"Missing")
+for_plot = mutate(g$data, 
+                  bmi_cat_factor = factor(group, levels=1:3, labels=bmi_labels)) 
+cplot = ggplot(data=for_plot, aes(x=time, y=est, col=factor(event)))+
+  geom_step(size=1.05)+
+  xlab('Days since mechanical ventilation started')+
+  ylab('Cumulative probability')+
+  scale_x_continuous(breaks=c(0, 20, 40, 60, 80))+
+  scale_colour_manual(name="Outcome:", values=c('purple','dodgerblue','indianred1'), labels=c("ECMO","Discharge",'Death')) +  
+  facet_wrap(~bmi_cat_factor)+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="cumunc_mv", 'Cumulative probabilities over time of starting ECMO, discharge and death. The panels show the three categories of BMI.') # title
+cplot
+jpeg(filename='figures/obese/cumulative_risks_mv.jpg', width=6, height=4, units='in', res=400, quality = 100)
+print(cplot)
+invisible(dev.off())
+```
+
+The cumulative risk plots show that the patients with a lower BMI had a higher cumulative probability of discharge (blue lines) and lower probability of death (red lines). The low and high BMI groups had a similar cumulative probability of being put on ECMO (purple lines).
+
+Those with a missing BMI were more likely to be discharged.
+
+### Cox models post MV start
+
+```{r, include=FALSE}
+results_exist = length(dir(path='results', pattern='mv_cox_models')) > 0
+if(results_exist==TRUE){
+  load('results/mv_cox_models.RData')
+}
+if(results_exist==FALSE){
+formula = "surv ~ 1 + age + bmi + sex + apache_cat + calendar_time + f(site_name, model = 'iid')"  
+all_events = c('date_int_state_start','discharge','death') # three events to model
+all_ests = NULL
+for (event in all_events){ # loop through events
+    model = list() # for storing imputed models
+    for (k in 1:N.impute){ # loop through imputations
+      this_data = complete(imputed_data_mv, k)
+      # model:
+      surv <- with(this_data, inla.surv(exit, to==event))
+      surv.model <- inla(as.formula(formula), data = this_data, family = "coxph") # 
+      model[[k]] = surv.model
+    } # end of imputation loop
+    # now average models using BMA (see https://becarioprecario.bitbucket.io/inla-gitbook/ch-missing.html#sec:misscovar)
+    model.imp <- inla.merge(model, rep(1 / N.impute, N.impute))
+    ests = mutate(model.imp$summary.fixed,
+                  vars = rownames(model.imp$summary.fixed),
+                  event = event,
+                  z = qnorm(0.975),
+                  lower = mean - (z*sd), # make CI
+                  upper = mean + (z*sd))
+    # concatenate estimates
+    all_ests = bind_rows(all_ests, ests)
+} # end of events loop
+  save(all_ests, file='results/mv_cox_models.RData')
+} # end of results exist
+```
+
+
+```{r}
+to_table = filter(all_ests, !str_detect(string=vars, pattern='(Intercept)')) %>%
+  mutate(
+    outcome = case_when(
+    event=='date_int_state_start' ~ 'ECMO',
+    event=='death' ~ 'Death',
+    event=='discharge' ~ 'Discharge'),
+    Variable = case_when(
+    vars=='sex' ~ 'Sex = male',
+    vars=='age' ~ 'Age (+10 years)',
+    vars == 'apache_catMissing'~ 'APACHE = missing',
+    vars == 'apache_catLow'~ 'APACHE = low',
+    vars=='calendar_time' ~ 'Time (+1 month)',
+    vars=='bmi' ~ 'BMI (+5 kg/m2)'
+  ), 
+  mean = exp(mean), # make hazard ratios
+  lower = exp(lower),
+  upper = exp(upper)
+  ) %>%
+  select(outcome, Variable, mean, lower, upper)
+ftab = flextable(to_table) %>%
+  theme_box() %>%
+  merge_v(j=1) %>%
+  colformat_num(j=3:5, digits=2) %>%
+  autofit()
+table_nums(name="cox_model_mv", "Hazard ratios and 95% credible intervals for the Cox models examining times after starting MV") # 
+ftab
+```
+
+The models adjust for site using a random intercept.
+
+The results show no clear association between higher BMI and death.
+
+# Appendix
+
+Here we check key model assumptions for the ECMO models. The results shown below would likely not go in the main section of any paper, but could be added to an online appendix.
+
+```{r, include=FALSE}
+## refit zero knot model ##
+
+k = 1 # just for one imputation of BMI
+this_data = complete(imputed_data, k) %>%
+  mutate(age2 = age*age) # non-linear age
+# add predictions - does not work!
+this_pred = data.frame(exit=as.numeric(NA), to=2, age=0, bmi=0, sex=1, calendar_time=0, site_name=NA)
+this_data_plus = bind_rows(this_data, this_pred)
+formula = "surv ~ 1 + age + bmi + sex + calendar_time + apache_cat + f(site_name, model = 'iid')" # formula without knot
+# discharge
+surv <- with(this_data, inla.surv(exit, to==2))
+surv.model.discharge <- inla(as.formula(formula), data = this_data, family = "coxph") # semi-parametric
+# death
+surv <- with(this_data, inla.surv(exit, to==3))
+surv.model.death <- inla(as.formula(formula), data = this_data, family = "coxph") # semi-parametric
+```
+
+## Plot the baseline hazards for the Cox model
+
+```{r, fig.width=7}
+## plot
+to_plot = bind_rows(surv.model.discharge$summary.random$baseline.hazard,
+                    surv.model.death$summary.random$baseline.hazard, .id='model') %>%
+  mutate(model = ifelse(model==1, 'Discharge', 'Death'))
+bplot = ggplot(data=to_plot, aes(x=ID, y=`0.5quant`))+#, ymin=`0.025quant`, ymax=`0.975quant`))+
+#  geom_ribbon(alpha=0.5)+
+  geom_line(size=1.05)+
+  xlab('Days since ECMO')+
+  ylab('Log-hazard')+
+  theme_bw()+
+  theme(panel.grid.minor= element_blank())+
+  scale_x_continuous(breaks=seq(0,90,10))+
+  facet_wrap(~model, scales='free_y')
+figure_nums(name="base_haz", "Baseline hazards from the Cox model", level=1) # increase level number for appendix
+bplot
+```
+
+## Survival times of censored observations
+
+```{r, fig.width=7}
+cen = survfit(Surv(time=exit, event=to=='0') ~ 1, data=trans.data)
+g = ggsurvplot(cen, 
+           break.time.by=10, 
+           xlim=c(0,90))
+# alternative plot
+cen_plot = ggplot(g$data.survplot, aes(x=time, y=1-surv, ymin = 1-lower, ymax=1-upper))+
+  geom_ribbon(alpha=0.5, fill='pink')+
+  geom_step(size=1.05, col='dark red')+
+  scale_y_continuous(limits=c(0,1))+
+  xlab('Days since ECMO start')+
+  ylab('Proportion censored')+
+  scale_x_continuous(breaks=seq(0,90,10))+
+  theme_bw()+
+  theme(panel.grid.minor= element_blank())
+figure_nums(name="censored", "Kaplan-Meier plot of the proportion of censored observations over time") # 
+cen_plot
+```
+
+The greatest number of censored patients is on day `r censor_day`, the last day of follow-up for this study when patients not yet discharged or dead are censored.
+
+## Residual checks of Cox models
+
+```{r, include=FALSE}
+# calculate the residuals
+res_discharge = bri.surv.resid(inla.obj = surv.model.discharge, time=this_data$exit, event=as.numeric(this_data$to==2))
+res_death = bri.surv.resid(inla.obj = surv.model.death, time=this_data$exit, event=as.numeric(this_data$to==3))
+```
+
+We use scatterplots of the Martingale residuals to check for non-linearity and outliers.
+Martingale residuals often have a skew and are not symmetric. 
+
+Positive Martingale residuals mean that the patient died sooner than expected (according to the model); negative values mean that the patient lived longer than expected (or were censored). The residuals for the models of time to discharge mean the patients was discharged sooner than expected (positive residual) or later than expected (negative residual).
+
+#### a) Age
+
+```{r, fig.width=7}
+# continuous covariates against martingale residuals
+res = data.frame(Death = res_death$martingale, Discharge = res_discharge$martingale)
+martingale = bind_cols(this_data, res) %>%
+  mutate(age = (age*10)+50,
+         bmi = (bmi*5)+30) # back-transform
+to_plot = select(martingale, age, to, Death, Discharge) %>%
+  pivot_longer(!c(age,to), names_to = "model", values_to = "res")
+nlplot = ggplot(data=to_plot, aes(x=age, y=res, col=factor(to)))+
+  scale_color_manual("Event", labels=c('Censored','Discharged','Died'), values=c('grey','dodgerblue2','firebrick2'))+
+  geom_hline(yintercept=0, lty=2)+
+  geom_point()+
+  xlab('Age (years)')+
+  ylab('Martingale residual')+
+  theme_bw()+
+  facet_wrap(~model, scales='free_y')
+figure_nums(name="mart1", "Martingale residuals from the Cox model against age") # 
+nlplot
+```
+
+#### b) BMI 
+
+```{r, fig.width=7}
+# continuous covariates against martingale residuals
+to_plot = select(martingale, bmi, to, Death, Discharge) %>%
+  pivot_longer(!c(bmi,to), names_to = "model", values_to = "res")
+nlplot = ggplot(data=to_plot, aes(x=bmi, y=res, col=factor(to)))+
+  scale_color_manual("Event", labels=c('Censored','Discharged','Died'), values=c('grey','dodgerblue2','firebrick2'))+
+  geom_hline(yintercept=0, lty=2)+
+  geom_point()+
+  xlab('BMI (kg/m2)')+
+  ylab('Martingale residual')+
+  theme_bw()+
+  facet_wrap(~model, scales='free_y')
+figure_nums(name="mart2", "Martingale residuals from the Cox model against BMI") # 
+nlplot
+```
+
+The table below shows some details on the relatively large outliers in the plots. 
+
+```{r}
+f = filter(martingale, bmi > 70) %>% # all the outliers are the big BMI
+  mutate(
+    sex = ifelse(sex==1, "Male", "Female"), 
+    outcome = case_when(
+     to == 0 ~ 'Censored',
+     to == 2 ~ 'Discharge',
+     to == 3 ~ 'Death')) %>%
+  select(exit, outcome, country, age, sex, bmi, apache_ii, Death, Discharge) %>%
+  rename('time' = 'exit')
+ftab = flextable(f) %>%
+  theme_box() %>%
+  fontsize(size = 8, part = "all") %>%
+  colformat_num(j=6:9, digits=0) %>%
+  autofit()
+table_nums(name="residuals", "Details on the patients with relatively large residuals", level=1) # increase table number for appendix 
+ftab
+```
+
+The `Death` and `Discharge` columns are the Martingale residuals for the death and discharge models.
+
+The patients with the two largest BMIs are outliers both in the age and BMI plots. Both were relatively young.
+
+The survival models have a relatively poor fit for very large BMIs.
+
+## Sensitivity analysis excluding large BMIs
+
+Given the relatively large residuals for the two largest BMIs, we run a sensitivity analysis below that excludes the two patients with a BMI over 70.
+
+```{r}
+model.death = model.discharge = list() # for storing imputed models
+for (k in 1:N.impute){
+  this_data = complete(imputed_data, k) %>%
+    filter(bmi < 70) # exclude large BMIs
+  formula = "surv ~ 1 + age + bmi +  sex + calendar_time + apache_cat + f(site_name, model = 'iid')" # formula without knot
+  # discharge
+  surv <- with(this_data, inla.surv(exit, to==2))
+  surv.model.discharge <- inla(as.formula(formula), data = this_data, family = "coxph") 
+  model.discharge[[k]] = surv.model.discharge
+# death
+  surv <- with(this_data, inla.surv(exit, to==3))
+  surv.model.death <- inla(as.formula(formula), data = this_data, family = "coxph")
+  model.death[[k]] = surv.model.death
+}
+# combine models using BMA
+model.imp.discharge <- inla.merge(model.discharge, rep(1 / N.impute, N.impute))
+model.imp.death <- inla.merge(model.death, rep(1 / N.impute, N.impute))
+ests = bind_rows(model.imp.discharge$summary.fixed,
+                 model.imp.death$summary.fixed, .id = 'event') %>%
+  mutate(     vars = rep(rownames(model.imp.discharge$summary.fixed),2),
+              event=event,
+              z=qnorm(0.975),
+              lower = mean - (z*sd), # make CI
+              upper = mean + (z*sd))
+```
+
+```{r}
+to_table = filter(ests, !str_detect(string=vars, pattern='(Intercept)')) %>%
+  mutate(
+    outcome = ifelse(event==1, 'Discharge','Death'),
+    Variable = case_when(
+    vars=='sex' ~ 'Sex = male',
+    vars=='age' ~ 'Age (+10 years)',
+    vars == 'apache_catMissing'~ 'APACHE = missing',
+    vars == 'apache_catLow'~ 'APACHE = low',
+    vars=='calendar_time' ~ 'Time (+1 month)',
+    vars=='bmi' ~ 'BMI (+5 kg/m2)'
+  ), 
+  mean = exp(mean), # make hazard ratios
+  lower = exp(lower),
+  upper = exp(upper)
+  ) %>%
+  select(outcome, Variable, mean, lower, upper)
+ftab = flextable(to_table) %>%
+  theme_box() %>%
+  colformat_num(j=3:5, digits=2) %>%
+  autofit()
+table_nums(name="cox_model_sens", "Hazard ratios and 95% credible intervals for the Cox models excluding patients with BMI over 70") # 
+ftab
+```
+
+A higher BMI is still associated with an increased risk of death.
+
+## Sensitivity analysis of influential sites
+
+Here we check if the results are strongly influenced by one site using a leave-one-out sensitivity analysis. Each site is left out in turn and the difference in the estimated risk of BMI is plotted. The plot shows the mean log hazard ratio (dot) and 95% confidence interval (vertical line).
+
+```{r, include=FALSE}
+results_exist = length(dir(path='results', pattern='obesity_leave_out_site')) > 0
+if(results_exist==TRUE){
+  load('results/obesity_leave_out_site.RData')
+}
+if(results_exist==FALSE){
+results_left_out = NULL
+sites = unique(trans.data$site_name)
+for (this_site in sites){# loop through sites 
+  model.death = model.discharge = list() # for storing imputed models
+  for (k in 1:N.impute){
+    this_data = complete(imputed_data, k) %>%
+      filter(site_name != this_site) # exclude one site
+    formula = "surv ~ 1 + age + bmi + sex + calendar_time + apache_cat + f(site_name, model = 'iid')" # formula without knot
+    # discharge
+    surv <- with(this_data, inla.surv(exit, to==2))
+    surv.model.discharge <- inla(as.formula(formula), data = this_data, family = "coxph") 
+    model.discharge[[k]] = surv.model.discharge
+    # death
+    surv <- with(this_data, inla.surv(exit, to==3))
+    surv.model.death <- inla(as.formula(formula), data = this_data, family = "coxph")
+    model.death[[k]] = surv.model.death
+  }
+  # combine models using BMA
+  model.imp.discharge <- inla.merge(model.discharge, rep(1 / N.impute, N.impute))
+  model.imp.death <- inla.merge(model.death, rep(1 / N.impute, N.impute))
+  ests = bind_rows(model.imp.discharge$summary.fixed,
+                   model.imp.death$summary.fixed, .id = 'event') %>%
+    mutate(vars = rep(rownames(model.imp.discharge$summary.fixed),2),
+           site = this_site,
+           event=event,
+           z=qnorm(0.975),
+           lower = mean - (z*sd), # make CI
+           upper = mean + (z*sd)) %>%
+    filter(vars == 'bmi')
+  results_left_out = bind_rows(results_left_out, ests)
+} #end of site loop
+save(results_left_out, file='results/obesity_leave_out_site.RData')
+} # end of results exist if
+```
+
+```{r, fig.width=7}
+results_left_out = mutate(results_left_out, 
+                          facet = ifelse(event==1, "Discharge", "Death")) %>%
+  arrange(event, mean) %>%
+  group_by(event) %>%
+  mutate(xaxis = 1:n()) %>%
+  ungroup()
+lplot = ggplot(data=results_left_out, aes(x=xaxis, y=mean, ymin=lower, ymax=upper))+
+  geom_point()+
+  geom_errorbar(width=0)+
+  facet_wrap(~facet, scales='free_y')+
+  scale_x_continuous(breaks = NULL)+
+  xlab('Site left out')+
+  ylab('Log hazard ratio')+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())
+figure_nums(name="leave_out", "Difference in the estimated risk for BMI after leaving out each site.") # 
+lplot
+```
+
+Results are ordered by the mean. The differences in estimates are small, hence the results are not dependent on one site.
